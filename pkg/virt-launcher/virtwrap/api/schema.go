@@ -652,10 +652,22 @@ type Controller struct {
 	Type      string            `xml:"type,attr"`
 	Index     string            `xml:"index,attr"`
 	Model     string            `xml:"model,attr,omitempty"`
+	ModelInfo *ControllerModel  `xml:"model,omitempty"`
+	Target    *ControllerTarget `xml:"target,omitempty"`
 	Driver    *ControllerDriver `xml:"driver,omitempty"`
 	Alias     *Alias            `xml:"alias,omitempty"`
 	Address   *Address          `xml:"address,omitempty"`
 	PCIHole64 *PCIHole64        `xml:"pcihole64,omitempty"`
+}
+
+type ControllerModel struct {
+	Name string `xml:"name,attr,omitempty"`
+}
+
+type ControllerTarget struct {
+	Chassis string `xml:"chassis,attr,omitempty"`
+	Port    string `xml:"port,attr,omitempty"`
+	Node    *int   `xml:"node,omitempty"`
 }
 
 // END Controller -----------------------------
