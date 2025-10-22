@@ -216,3 +216,7 @@ func (config *ClusterConfig) HostDevicesWithDRAEnabled() bool {
 func (config *ClusterConfig) IncrementalBackupEnabled() bool {
 	return config.isFeatureGateEnabled(featuregate.IncrementalBackupGate)
 }
+
+func (config *ClusterConfig) PCINUMAAwareTopologyEnabled() bool {
+	return config.isFeatureGateEnabled(featuregate.PCINUMAAwareTopology)
+}

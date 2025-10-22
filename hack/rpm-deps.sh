@@ -7,7 +7,7 @@ source hack/bootstrap.sh
 source hack/config.sh
 
 LIBVIRT_VERSION=${LIBVIRT_VERSION:-0:10.10.0-13.el9}
-QEMU_VERSION=${QEMU_VERSION:-17:9.1.0-20.el9}
+QEMU_VERSION=${QEMU_VERSION:-17:9.1.0-29.el9}
 SEABIOS_VERSION=${SEABIOS_VERSION:-0:1.16.3-4.el9}
 EDK2_VERSION=${EDK2_VERSION:-0:20241117-3.el9}
 LIBGUESTFS_VERSION=${LIBGUESTFS_VERSION:-1:1.54.0-9.el9}
@@ -56,7 +56,7 @@ testimage_main="
   iputils
   nmap-ncat
   procps-ng
-  qemu-img-${QEMU_VERSION}
+  qemu-kvm-tools-${QEMU_VERSION}
   sevctl
   tar
   targetcli
@@ -126,12 +126,14 @@ launcherbase_extra="
 "
 
 handlerbase_main="
-  qemu-img-${QEMU_VERSION}
+  qemu-kvm-tools-${QEMU_VERSION}
   passt-${PASST_VERSION}
 "
 handlerbase_extra="
+  cyrus-sasl-lib
   findutils
   iproute
+  json-c
   nftables
   procps-ng
   selinux-policy
@@ -139,6 +141,11 @@ handlerbase_extra="
   tar
   util-linux
   xorriso
+  libssh
+  libtirpc
+  libvirt-libs-${LIBVIRT_VERSION}
+  libnl3
+  numactl-libs
 "
 
 libguestfstools_main="
