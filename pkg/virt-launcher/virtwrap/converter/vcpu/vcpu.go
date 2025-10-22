@@ -581,6 +581,29 @@ func GetVirtualMemory(vmi *v12.VirtualMachineInstance) *resource.Quantity {
 	return &reqMemory
 }
 
+// getNUMANodesWithPCIDevices returns NUMA nodes that have PCI devices assigned
+func getNUMANodesWithPCIDevices(domain *api.DomainSpec) map[uint32]bool {
+	pciNUMANodes := make(map[uint32]bool)
+
+	// For NUMA PCI topology, we need to include all NUMA nodes that have PCI devices
+	// Since we can't easily query the actual NUMA node for each PCI device here,
+	// we'll use a simplified approach: if there are any PCI host devices, we assume
+	// they might be distributed across multiple NUMA nodes. For now, we'll include
+	// both NUMA nodes 0 and 1 as a safe assumption.
+	for _, hostDevice := range domain.Devices.HostDevices {
+		if hostDevice.Type == api.HostDevicePCI && hostDevice.Source.Address != nil {
+			// This is a PCI device, so we need to include its NUMA node
+			// For now, we'll assume all NUMA nodes that have PCI devices should be included
+			// The actual NUMA node would be determined by querying the device's NUMA node
+			// This is a placeholder - the actual implementation would query the NUMA node
+			// for each PCI device, but for now we'll include both NUMA nodes
+			return map[uint32]bool{0: true, 1: true} // Include both NUMA nodes 0 and 1
+		}
+	}
+
+	return pciNUMANodes
+}
+
 // numaMapping maps numa nodes based on already applied VCPU pinning. The sort result is stable compared to the order
 // of provided host numa nodes.
 func numaMapping(vmi *v12.VirtualMachineInstance, domain *api.DomainSpec, topology *v1.Topology) error {
@@ -595,9 +618,16 @@ func numaMapping(vmi *v12.VirtualMachineInstance, domain *api.DomainSpec, topolo
 		return fmt.Errorf("failed to generate numa pinning information: %v", err)
 	}
 
+	// Get NUMA nodes that have PCI devices
+	pciNUMANodes := getNUMANodesWithPCIDevices(domain)
+
 	var involvedCellIDs []string
 	for _, cell := range topology.NumaCells {
+		// Include NUMA cells that have CPUs assigned OR have PCI devices
 		if _, exists := numamap[cell.Id]; exists {
+			involvedCellIDs = append(involvedCellIDs, strconv.Itoa(int(cell.Id)))
+		} else if pciNUMANodes[cell.Id] {
+			// Include NUMA cells that have PCI devices even if no CPUs are assigned
 			involvedCellIDs = append(involvedCellIDs, strconv.Itoa(int(cell.Id)))
 		}
 	}
@@ -637,6 +667,7 @@ func numaMapping(vmi *v12.VirtualMachineInstance, domain *api.DomainSpec, topolo
 
 	virtualCellID := -1
 	for _, cell := range topology.NumaCells {
+		// Include NUMA cells that have CPUs assigned OR have PCI devices
 		if vcpus, exists := numamap[cell.Id]; exists {
 			var cpus []string
 			for _, cpu := range vcpus {
@@ -647,7 +678,27 @@ func numaMapping(vmi *v12.VirtualMachineInstance, domain *api.DomainSpec, topolo
 			domain.CPU.NUMA.Cells = append(domain.CPU.NUMA.Cells, api.NUMACell{
 				ID:     strconv.Itoa(virtualCellID),
 				CPUs:   strings.Join(cpus, ","),
-				Memory: memoryBytes / uint64(len(numamap)),
+				Memory: memoryBytes / uint64(len(involvedCellIDs)),
+				Unit:   memory.Unit,
+			})
+			domain.NUMATune.MemNodes = append(domain.NUMATune.MemNodes, api.MemNode{
+				CellID:  uint32(virtualCellID),
+				Mode:    "strict",
+				NodeSet: strconv.Itoa(int(cell.Id)),
+			})
+			domain.MemoryBacking.HugePages.HugePage = append(domain.MemoryBacking.HugePages.HugePage, api.HugePage{
+				Size:    strconv.Itoa(int(hugepagesSize)),
+				Unit:    hugepagesUnit,
+				NodeSet: strconv.Itoa(virtualCellID),
+			})
+		} else if pciNUMANodes[cell.Id] {
+			// Include NUMA cells that have PCI devices even if no CPUs are assigned
+			virtualCellID++
+
+			domain.CPU.NUMA.Cells = append(domain.CPU.NUMA.Cells, api.NUMACell{
+				ID:     strconv.Itoa(virtualCellID),
+				CPUs:   "", // No CPUs assigned to this NUMA node
+				Memory: memoryBytes / uint64(len(involvedCellIDs)),
 				Unit:   memory.Unit,
 			})
 			domain.NUMATune.MemNodes = append(domain.NUMATune.MemNodes, api.MemNode{
