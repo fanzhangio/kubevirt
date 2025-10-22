@@ -113,21 +113,85 @@ func ParsePciAddress(pciAddress string) ([]string, error) {
 	return res[1:], nil
 }
 
+func FormatPCIAddress(address *api.Address) (string, error) {
+	if address == nil {
+		return "", fmt.Errorf("address is nil")
+	}
+	if address.Type != "" && address.Type != api.AddressPCI {
+		return "", fmt.Errorf("address type %s is not pci", address.Type)
+	}
+	formatComponent := func(value string, width int) (string, error) {
+		if value == "" {
+			return "", fmt.Errorf("address component missing")
+		}
+		trimmed := strings.TrimPrefix(strings.ToLower(value), "0x")
+		if len(trimmed) > width {
+			return "", fmt.Errorf("address component %s exceeds width %d", trimmed, width)
+		}
+		return fmt.Sprintf("%0*s", width, trimmed), nil
+	}
+
+	domain, err := formatComponent(address.Domain, 4)
+	if err != nil {
+		return "", err
+	}
+	bus, err := formatComponent(address.Bus, 2)
+	if err != nil {
+		return "", err
+	}
+	slot, err := formatComponent(address.Slot, 2)
+	if err != nil {
+		return "", err
+	}
+	function, err := formatComponent(address.Function, 1)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s:%s:%s.%s", domain, bus, slot, function), nil
+}
+
+func GetMdevParentPCIAddress(mdevUUID string) (string, error) {
+	if mdevUUID == "" {
+		return "", fmt.Errorf("mdev uuid is empty")
+	}
+	basePath := filepath.Join("/sys/bus/mdev/devices", mdevUUID, "physfn")
+	target, err := os.Readlink(basePath)
+	if err != nil {
+		return "", err
+	}
+	segments := strings.Split(target, "/")
+	if len(segments) == 0 {
+		return "", fmt.Errorf("unexpected physfn symlink format for %s", mdevUUID)
+	}
+	return segments[len(segments)-1], nil
+}
+
 func GetDeviceNumaNode(pciAddress string) (*uint32, error) {
+	numaNode, err := GetDeviceNumaNodeInt(pciAddress)
+	if err != nil {
+		return nil, err
+	}
+	if numaNode < 0 {
+		return nil, fmt.Errorf("numa node information unavailable for device %s", pciAddress)
+	}
+	value := uint32(numaNode)
+	return &value, nil
+}
+
+func GetDeviceNumaNodeInt(pciAddress string) (int, error) {
 	pciBasePath := "/sys/bus/pci/devices"
 	numaNodePath := filepath.Join(pciBasePath, pciAddress, "numa_node")
 	// #nosec No risk for path injection. Reading static path of NUMA node info
 	numaNodeStr, err := os.ReadFile(numaNodePath)
 	if err != nil {
-		return nil, err
+		return -1, err
 	}
 	numaNodeStr = bytes.TrimSpace(numaNodeStr)
 	numaNodeInt, err := strconv.Atoi(string(numaNodeStr))
 	if err != nil {
-		return nil, err
+		return -1, err
 	}
-	numaNode := uint32(numaNodeInt)
-	return &numaNode, nil
+	return numaNodeInt, nil
 }
 
 func GetDeviceAlignedCPUs(pciAddress string) ([]int, error) {

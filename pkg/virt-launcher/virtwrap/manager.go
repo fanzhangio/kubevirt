@@ -2310,7 +2310,11 @@ func (l *LibvirtDomainManager) getDomainDirtyRateStats(calculationDuration time.
 }
 
 func formatPCIAddressStr(address *api.Address) string {
-	return fmt.Sprintf("%s:%s:%s.%s", address.Domain[2:], address.Bus[2:], address.Slot[2:], address.Function[2:])
+	formatted, err := hardware.FormatPCIAddress(address)
+	if err != nil {
+		return ""
+	}
+	return formatted
 }
 
 func addToDeviceMetadata(metadataType cloudinit.DeviceMetadataType, address *api.Address, mac string, tag string, devicesMetadata []cloudinit.DeviceData, numa *uint32, numaAlignedCPUs []uint32) []cloudinit.DeviceData {
