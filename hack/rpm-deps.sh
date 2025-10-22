@@ -15,6 +15,7 @@ GUESTFSTOOLS_VERSION=${GUESTFSTOOLS_VERSION:-0:1.52.2-5.el9}
 PASST_VERSION=${PASST_VERSION:-0:0^20250512.g8ec1341-2.el9}
 VIRTIOFSD_VERSION=${VIRTIOFSD_VERSION:-0:1.13.0-1.el9}
 SWTPM_VERSION=${SWTPM_VERSION:-0:0.8.0-2.el9}
+CYRUS_SASL_VERSION=${CYRUS_SASL_VERSION:-0:2.1.27-21.el9}
 SINGLE_ARCH=${SINGLE_ARCH:-""}
 BASESYSTEM=${BASESYSTEM:-"centos-stream-release"}
 
@@ -128,6 +129,7 @@ launcherbase_extra="
 handlerbase_main="
   qemu-img-${QEMU_VERSION}
   passt-${PASST_VERSION}
+  cyrus-sasl-lib-${CYRUS_SASL_VERSION}
 "
 handlerbase_extra="
   findutils
