@@ -51,41 +51,53 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	if vmi == nil || domain == nil {
 		return
 	}
+	log.Log.V(1).Info("evaluating host device NUMA topology passthrough")
 	// Host devcies NUMA passthrough only works when CPU NUMA passthrough is enabled
 	// because without CPU NUMA passthrough, there will be only one NUMA node in the guest
 	// so all host devices will be assigned to the same NUMA node.
 	if vmi.Spec.Domain.CPU == nil ||
 		vmi.Spec.Domain.CPU.NUMA == nil ||
 		vmi.Spec.Domain.CPU.NUMA.GuestMappingPassthrough == nil {
+		log.Log.V(1).Info("NUMA host device topology not applied: guestMappingPassthrough disabled")
 		return
 	}
 
 	hostDevices := domain.Spec.Devices.HostDevices
 	if len(hostDevices) == 0 {
+		log.Log.V(1).Info("NUMA host device topology not applied: no host devices present")
 		return
 	}
 
+	log.Log.V(1).Infof("NUMA host device topology: processing %d host devices", len(hostDevices))
 	planner := newNUMAPCIPlanner(domain)
 	grouped := make(map[int][]*api.HostDevice)
 
 	for i := range hostDevices {
 		dev := &domain.Spec.Devices.HostDevices[i]
 		if dev.Type != api.HostDevicePCI && dev.Type != api.HostDeviceMDev {
+			log.Log.V(1).Infof("skipping host device %d with unsupported type %s", i, dev.Type)
 			continue
 		}
 		bdf, err := resolveHostDevicePCIAddress(dev)
 		if err != nil {
-			log.Log.V(3).Reason(err).Info("unable to resolve host device PCI address for NUMA planning, skipping")
+			log.Log.V(1).Reason(err).Info("unable to resolve host device PCI address for NUMA planning, skipping")
 			continue
 		}
 		numaNode, err := getDeviceNumaNodeIntFunc(bdf)
 		if err != nil || numaNode < 0 {
+			if err != nil {
+				log.Log.V(1).Reason(err).Infof("skipping host device %s - failed to detect NUMA node", bdf)
+			} else {
+				log.Log.V(1).Infof("skipping host device %s - NUMA node not available", bdf)
+			}
 			continue
 		}
+		log.Log.V(1).Infof("host device %s grouped to NUMA node %d", bdf, numaNode)
 		grouped[numaNode] = append(grouped[numaNode], dev)
 	}
 
 	if len(grouped) == 0 {
+		log.Log.V(1).Info("NUMA host device topology not applied: no devices with NUMA affinity detected")
 		return
 	}
 
@@ -100,6 +112,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		if len(devices) == 0 {
 			continue
 		}
+		log.Log.V(1).Infof("setting up PCI expander bus for NUMA node %d with %d devices", numaNode, len(devices))
 		pxb, err := planner.ensurePXBForNUMA(numaNode)
 		if err != nil {
 			log.Log.Reason(err).Errorf("failed to create PCI expander bus for NUMA node %d", numaNode)
@@ -112,6 +125,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 				continue
 			}
 			assignHostDeviceToRootPort(dev, rootPort)
+			log.Log.V(1).Infof("assigned host device to NUMA node %d bus %#02x", numaNode, rootPort.bus)
 		}
 	}
 }
