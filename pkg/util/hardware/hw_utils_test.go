@@ -20,6 +20,9 @@
 package hardware
 
 import (
+	"os"
+	"path/filepath"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -117,6 +120,74 @@ var _ = Describe("Hardware utils test", func() {
 					Expect(err).ToNot(HaveOccurred())
 				}
 			}
+		})
+	})
+
+	Context("mdev parent detection", func() {
+		var (
+			tmpDir  string
+			oldBase string
+		)
+
+		BeforeEach(func() {
+			var err error
+			tmpDir, err = os.MkdirTemp("", "kubevirt-mdev-*")
+			Expect(err).ToNot(HaveOccurred())
+			oldBase = mdevDevicesBasePath
+			mdevDevicesBasePath = tmpDir
+		})
+
+		AfterEach(func() {
+			mdevDevicesBasePath = oldBase
+			Expect(os.RemoveAll(tmpDir)).To(Succeed())
+		})
+
+		It("extracts the parent pci address from the mdev_type symlink real path", func() {
+			uuid := "435a944e-07a7-4aab-8502-7c2b327ae40a"
+			mdevDir := filepath.Join(tmpDir, uuid)
+			Expect(os.MkdirAll(mdevDir, 0o755)).To(Succeed())
+
+			parentBDF := "0000:82:00.4"
+			target := filepath.Join(tmpDir, "devices", "pci0000:80", "0000:80:03.1", parentBDF, "mdev_supported_types", "nvidia-1168")
+			Expect(os.MkdirAll(target, 0o755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDir, "mdev_type"))).To(Succeed())
+
+			addr, err := GetMdevParentPCIAddress(uuid)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(addr).To(Equal("0000:82:00.4"))
+		})
+
+		It("returns canonical lower-case bdf", func() {
+			uuid := "canonical-bdf"
+			mdevDir := filepath.Join(tmpDir, uuid)
+			Expect(os.MkdirAll(mdevDir, 0o755)).To(Succeed())
+
+			parentBDF := "0000:AF:00.0"
+			target := filepath.Join(tmpDir, "sys", "devices", "pci0000:80", "0000:80:03.1", parentBDF, "mdev_supported_types", "type-1")
+			Expect(os.MkdirAll(target, 0o755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDir, "mdev_type"))).To(Succeed())
+
+			addr, err := GetMdevParentPCIAddress(uuid)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(addr).To(Equal("0000:af:00.0"))
+		})
+
+		It("fails when the mdev_type symlink is missing", func() {
+			_, err := GetMdevParentPCIAddress("missing")
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("fails when the parent path is not a pci address", func() {
+			uuid := "invalid-parent"
+			mdevDir := filepath.Join(tmpDir, uuid)
+			Expect(os.MkdirAll(mdevDir, 0o755)).To(Succeed())
+
+			target := filepath.Join(tmpDir, "weird", "path", "not-a-bdf", "mdev_supported_types", "type-1")
+			Expect(os.MkdirAll(target, 0o755)).To(Succeed())
+			Expect(os.Symlink(target, filepath.Join(mdevDir, "mdev_type"))).To(Succeed())
+
+			_, err := GetMdevParentPCIAddress(uuid)
+			Expect(err).To(HaveOccurred())
 		})
 	})
 })
