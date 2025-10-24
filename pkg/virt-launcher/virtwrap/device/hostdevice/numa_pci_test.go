@@ -138,10 +138,10 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 		t.Fatalf("expected expander buses for NUMA nodes 0 and 1, got %v", numaNodes)
 	}
 
-	rootPortBuses := make(map[string]struct{})
+	rootPortControllers := make(map[string]struct{})
 	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil {
-			rootPortBuses[ctrl.Address.Bus] = struct{}{}
+		if ctrl.Model == "pcie-root-port" {
+			rootPortControllers[ctrl.Index] = struct{}{}
 		}
 	}
 
@@ -149,8 +149,14 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
 		}
-		if _, found := rootPortBuses[dev.Address.Bus]; !found {
-			t.Fatalf("expected host device %d to be attached to one of the NUMA root ports, got bus %s", i, dev.Address.Bus)
+		if dev.Address.Controller == "" {
+			t.Fatalf("expected host device %d to reference a root port controller", i)
+		}
+		if _, found := rootPortControllers[dev.Address.Controller]; !found {
+			t.Fatalf("expected host device %d to reference a NUMA root port controller, got index %s", i, dev.Address.Controller)
+		}
+		if dev.Address.Bus == "" {
+			t.Fatalf("expected host device %d to have a downstream bus assigned", i)
 		}
 	}
 }
@@ -921,7 +927,6 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 
 	port := &rootPortInfo{
 		controllerIndex: 5,
-		bus:             3,
 	}
 
 	assignHostDeviceToRootPort(dev, port)
@@ -936,8 +941,11 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 	if dev.Address.Domain != "0x0000" {
 		t.Fatalf("expected domain to be 0x0000, got %s", dev.Address.Domain)
 	}
-	if dev.Address.Bus != "0x03" {
-		t.Fatalf("expected bus to be 0x03, got %s", dev.Address.Bus)
+	if dev.Address.Bus != "0x05" {
+		t.Fatalf("expected bus to be 0x05, got %s", dev.Address.Bus)
+	}
+	if dev.Address.Controller != "5" {
+		t.Fatalf("expected controller to be 5, got %s", dev.Address.Controller)
 	}
 	// Slot and function should be empty to trigger PCI placement
 	if dev.Address.Slot != "" {
@@ -964,14 +972,16 @@ func TestHostDeviceAddressFormat(t *testing.T) {
 
 	port := &rootPortInfo{
 		controllerIndex: 10,
-		bus:             5,
 	}
 
 	assignHostDeviceToRootPort(dev, port)
 
 	// Should use correct hex formatting for bus, slot/function empty for PCI placement
-	if dev.Address.Bus != "0x05" {
-		t.Fatalf("expected bus to be formatted as 0x05, got %s", dev.Address.Bus)
+	if dev.Address.Bus != "0x0a" {
+		t.Fatalf("expected bus to be formatted as 0x0a, got %s", dev.Address.Bus)
+	}
+	if dev.Address.Controller != "10" {
+		t.Fatalf("expected controller to be 10, got %s", dev.Address.Controller)
 	}
 	if dev.Address.Slot != "" {
 		t.Fatalf("expected slot to be empty for PCI placement, got %s", dev.Address.Slot)
@@ -1245,31 +1255,20 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 
 	// Verify root ports are created (7 devices per NUMA node = 14 total root ports)
 	var rootPortCount int
-	var rootPortBuses = make(map[string]int) // bus -> count
+	rootPortControllers := make(map[string]struct{})
 	for _, ctrl := range domain.Spec.Devices.Controllers {
 		if ctrl.Model == "pcie-root-port" {
 			rootPortCount++
-			if ctrl.Address != nil {
-				rootPortBuses[ctrl.Address.Bus]++
-			}
+			rootPortControllers[ctrl.Index] = struct{}{}
 		}
 	}
 
-	if rootPortCount != 14 {
-		t.Fatalf("expected 14 root ports (7 per NUMA node), got %d", rootPortCount)
-	}
-
-	// Verify each NUMA node has 7 root ports
-	if len(rootPortBuses) != 2 {
-		t.Fatalf("expected root ports on 2 different buses (one per NUMA node), got %d buses", len(rootPortBuses))
-	}
-	for bus, count := range rootPortBuses {
-		if count != 7 {
-			t.Fatalf("expected 7 root ports on bus %s, got %d", bus, count)
-		}
+	if rootPortCount != len(hostDevices) {
+		t.Fatalf("expected %d root ports, got %d", len(hostDevices), rootPortCount)
 	}
 
 	// Verify all host devices have addresses assigned
+	seenBuses := make(map[string]struct{})
 	for i, dev := range domain.Spec.Devices.HostDevices {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
@@ -1278,65 +1277,19 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 		if dev.Address.Bus == "0x00" {
 			t.Fatalf("expected host device %d to be assigned to NUMA-specific bus, not root bus", i)
 		}
-	}
-
-	// Verify device grouping by NUMA node
-	// NUMA node 0 devices should be on one bus, NUMA node 1 on another
-	var numa0Buses = make(map[string]bool)
-	var numa1Buses = make(map[string]bool)
-
-	for i, dev := range domain.Spec.Devices.HostDevices {
-		if dev.Address != nil {
-			// Determine which NUMA node this device belongs to based on original BDF
-			originalBDF := fmt.Sprintf("0000:%s:00.0",
-				strings.TrimPrefix(hostDevices[i].Source.Address.Bus, "0x"))
-
-			var expectedNumaNode int
-			switch originalBDF {
-			case "0000:03:00.0", "0000:04:00.0", "0000:05:00.0", "0000:06:00.0",
-				"0000:07:00.0", "0000:08:00.0", "0000:41:00.0":
-				expectedNumaNode = 0
-			case "0000:83:00.0", "0000:84:00.0", "0000:85:00.0", "0000:86:00.0",
-				"0000:87:00.0", "0000:88:00.0", "0000:89:00.0":
-				expectedNumaNode = 1
-			default:
-				t.Fatalf("unexpected device BDF: %s", originalBDF)
-			}
-
-			if expectedNumaNode == 0 {
-				numa0Buses[dev.Address.Bus] = true
-			} else {
-				numa1Buses[dev.Address.Bus] = true
-			}
+		if dev.Address.Controller == "" {
+			t.Fatalf("expected host device %d to reference a root port controller", i)
 		}
+		if _, exists := rootPortControllers[dev.Address.Controller]; !exists {
+			t.Fatalf("expected host device %d to reference an existing root port controller, got %s", i, dev.Address.Controller)
+		}
+		seenBuses[dev.Address.Bus] = struct{}{}
 	}
 
-	// Each NUMA node should have devices on a single bus
-	if len(numa0Buses) != 1 {
-		t.Fatalf("expected NUMA node 0 devices to be on single bus, got %d buses: %v",
-			len(numa0Buses), numa0Buses)
+	if len(seenBuses) != len(hostDevices) {
+		t.Fatalf("expected each host device to use a unique downstream bus, got %d unique buses for %d devices",
+			len(seenBuses), len(hostDevices))
 	}
-	if len(numa1Buses) != 1 {
-		t.Fatalf("expected NUMA node 1 devices to be on single bus, got %d buses: %v",
-			len(numa1Buses), numa1Buses)
-	}
-
-	// The two NUMA buses should be different
-	var numa0Bus, numa1Bus string
-	for bus := range numa0Buses {
-		numa0Bus = bus
-	}
-	for bus := range numa1Buses {
-		numa1Bus = bus
-	}
-	if numa0Bus == numa1Bus {
-		t.Fatalf("expected different buses for NUMA nodes 0 and 1, both using bus %s", numa0Bus)
-	}
-
-	t.Logf("NUMA Node 0 devices assigned to bus: %s", numa0Bus)
-	t.Logf("NUMA Node 1 devices assigned to bus: %s", numa1Bus)
-	t.Logf("Total PXB controllers: %d", pxbCount)
-	t.Logf("Total root ports: %d", rootPortCount)
 }
 
 // Conflict Detection Tests

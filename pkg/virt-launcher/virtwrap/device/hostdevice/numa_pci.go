@@ -44,7 +44,6 @@ type pxbInfo struct {
 
 type rootPortInfo struct {
 	controllerIndex int
-	bus             int
 }
 
 func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Domain) {
@@ -125,7 +124,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 				continue
 			}
 			assignHostDeviceToRootPort(dev, rootPort)
-			log.Log.V(1).Infof("assigned host device to NUMA node %d bus %#02x", numaNode, rootPort.bus)
+			log.Log.V(1).Infof("assigned host device to NUMA node %d bus %#02x", numaNode, rootPort.controllerIndex)
 		}
 	}
 }
@@ -259,7 +258,6 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo) (*rootPortInfo, error) {
 
 	return &rootPortInfo{
 		controllerIndex: index,
-		bus:             info.index,
 	}, nil
 }
 
@@ -291,9 +289,10 @@ func assignHostDeviceToRootPort(dev *api.HostDevice, port *rootPortInfo) {
 	}
 	// Set NUMA-specific bus, let PCI placement handle slot assignment
 	dev.Address = &api.Address{
-		Type:   api.AddressPCI,
-		Domain: rootBusDomain,
-		Bus:    fmt.Sprintf("0x%02x", port.bus),
+		Type:       api.AddressPCI,
+		Domain:     rootBusDomain,
+		Controller: strconv.Itoa(port.controllerIndex),
+		Bus:        fmt.Sprintf("0x%02x", port.controllerIndex),
 		// Slot and Function left empty to trigger PCI placement logic
 		Slot:     "",
 		Function: "",

@@ -636,6 +636,11 @@ func (in *Controller) DeepCopyInto(out *Controller) {
 		*out = new(Address)
 		**out = **in
 	}
+	if in.PCIHole64 != nil {
+		in, out := &in.PCIHole64, &out.PCIHole64
+		*out = new(PCIHole64)
+		**out = **in
+	}
 	return
 }
 

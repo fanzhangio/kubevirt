@@ -130,8 +130,10 @@ handlerbase_main="
   passt-${PASST_VERSION}
 "
 handlerbase_extra="
+  cyrus-sasl-lib
   findutils
   iproute
+  json-c
   nftables
   procps-ng
   selinux-policy
@@ -139,6 +141,11 @@ handlerbase_extra="
   tar
   util-linux
   xorriso
+  libssh
+  libtirpc
+  libvirt-libs-${LIBVIRT_VERSION}
+  libnl3
+  numactl-libs
 "
 
 libguestfstools_main="

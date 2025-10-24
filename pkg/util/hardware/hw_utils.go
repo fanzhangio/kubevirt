@@ -37,6 +37,10 @@ const (
 	PCI_ADDRESS_PATTERN = `^([\da-fA-F]{4}):([\da-fA-F]{2}):([\da-fA-F]{2})\.([0-7]{1})$`
 )
 
+var (
+	mdevDevicesBasePath = "/sys/bus/mdev/devices"
+)
+
 // Parse linux cpuset into an array of ints
 // See: http://man7.org/linux/man-pages/man7/cpuset.7.html#FORMATS
 func ParseCPUSetLine(cpusetLine string, limit int) (cpusList []int, err error) {
@@ -154,16 +158,16 @@ func GetMdevParentPCIAddress(mdevUUID string) (string, error) {
 	if mdevUUID == "" {
 		return "", fmt.Errorf("mdev uuid is empty")
 	}
-	basePath := filepath.Join("/sys/bus/mdev/devices", mdevUUID, "physfn")
-	target, err := os.Readlink(basePath)
+	mdevTypePath := filepath.Join(mdevDevicesBasePath, mdevUUID, "mdev_type")
+	resolvedPath, err := filepath.EvalSymlinks(mdevTypePath)
 	if err != nil {
 		return "", err
 	}
-	segments := strings.Split(target, "/")
-	if len(segments) == 0 {
-		return "", fmt.Errorf("unexpected physfn symlink format for %s", mdevUUID)
-	}
-	return segments[len(segments)-1], nil
+	supportedTypesDir := filepath.Dir(resolvedPath)
+	deviceDir := filepath.Dir(supportedTypesDir)
+	parentDevice := filepath.Base(deviceDir)
+
+	return canonicalizePCIAddress(parentDevice)
 }
 
 func GetDeviceNumaNode(pciAddress string) (*uint32, error) {
@@ -219,6 +223,37 @@ func GetNumaNodeCPUList(numaNode int) ([]int, error) {
 	}
 
 	return cpusList, nil
+}
+
+func canonicalizePCIAddress(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", fmt.Errorf("empty pci address candidate")
+	}
+
+	segments, err := ParsePciAddress(value)
+	if err != nil {
+		return "", err
+	}
+
+	domain, err := strconv.ParseUint(segments[0], 16, 16)
+	if err != nil {
+		return "", err
+	}
+	bus, err := strconv.ParseUint(segments[1], 16, 8)
+	if err != nil {
+		return "", err
+	}
+	slot, err := strconv.ParseUint(segments[2], 16, 8)
+	if err != nil {
+		return "", err
+	}
+	function, err := strconv.ParseUint(segments[3], 16, 4)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%04x:%02x:%02x.%1x", domain, bus, slot, function), nil
 }
 
 func LookupDeviceVCPUAffinity(pciAddress string, domainSpec *api.DomainSpec) ([]uint32, error) {
