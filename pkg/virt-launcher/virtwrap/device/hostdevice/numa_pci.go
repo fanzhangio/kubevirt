@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	rootBusDomain   = "0x0000"
-	defaultPXBSlot  = 0x0a
-	maxRootBusSlot  = 0x1f
-	maxRootPortSlot = 0x1f
+	rootBusDomain    = "0x0000"
+	defaultPXBSlot   = 0x0a
+	maxRootBusSlot   = 0x1f
+	maxRootPortSlot  = 0x1f
+	unifiedNUMAGroup = 0
 )
 
 var (
@@ -68,6 +69,11 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	}
 
 	log.Log.V(1).Infof("NUMA host device topology: processing %d host devices", len(hostDevices))
+	collapseNUMA := shouldCollapseHostDeviceNUMA(vmi, domain)
+	if collapseNUMA {
+		log.Log.V(1).Info("collapsing host device NUMA groups to a single guest NUMA node")
+	}
+
 	planner := newNUMAPCIPlanner(domain)
 	grouped := make(map[int][]*api.HostDevice)
 
@@ -91,8 +97,14 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			}
 			continue
 		}
-		log.Log.V(1).Infof("host device %s grouped to NUMA node %d", bdf, numaNode)
-		grouped[numaNode] = append(grouped[numaNode], dev)
+		groupKey := numaNode
+		if collapseNUMA {
+			log.Log.V(1).Infof("host device %s (host NUMA %d) collapsed to guest NUMA group %d", bdf, numaNode, unifiedNUMAGroup)
+			groupKey = unifiedNUMAGroup
+		} else {
+			log.Log.V(1).Infof("host device %s grouped to NUMA node %d", bdf, groupKey)
+		}
+		grouped[groupKey] = append(grouped[groupKey], dev)
 	}
 
 	if len(grouped) == 0 {
@@ -123,6 +135,8 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 				log.Log.Reason(err).Error("failed to allocate root port for host device")
 				continue
 			}
+			// The planner hands out each PCIe root port controller a monotonically increasing index (starting from whatever the domain already used).
+			//  When we assign a host device to that root port we derive the downstream bus straight from that index:
 			assignHostDeviceToRootPort(dev, rootPort)
 			log.Log.V(1).Infof("assigned host device to NUMA node %d bus %#02x", numaNode, rootPort.controllerIndex)
 		}
@@ -283,6 +297,10 @@ func (p *numaPCIPlanner) allocateChassis() int {
 	return -1
 }
 
+// TODO: (fanzhangio) The downstream bus assigned to each controller is derived from the controller index;
+// controller indices are monotonic in the planner and a practical deployment never approaches the
+// 0xff PCI bus ceiling, but if we ever expose hundreds of root ports this is the place to revisit the
+// numbering scheme before libvirt complains.
 func assignHostDeviceToRootPort(dev *api.HostDevice, port *rootPortInfo) {
 	if dev.Address == nil {
 		dev.Address = &api.Address{}
@@ -312,4 +330,22 @@ func resolveHostDevicePCIAddress(dev *api.HostDevice) (string, error) {
 		return formatPCIAddressFunc(addr)
 	}
 	return "", fmt.Errorf("unsupported host device address format")
+}
+
+// shouldCollapseHostDeviceNUMA returns true when PCI host devices should all be mapped to a single
+// guest NUMA node. This happens when CPU NUMA passthrough is enabled (already validated by the caller)
+// but the converter produced only one guest NUMA cell (for example cpumanager pinned every vCPU to the
+// same host NUMA cell). We rely on the converter to populate domain.Spec.CPU.NUMA after vCPU pinning;
+// if this helper runs earlier in the pipeline we intentionally fall back to per-host NUMA grouping to
+// preserve behaviour.
+func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Domain) bool {
+	if vmi == nil || domain == nil {
+		return false
+	}
+
+	if domain.Spec.CPU.NUMA == nil {
+		return false
+	}
+
+	return len(domain.Spec.CPU.NUMA.Cells) <= 1
 }

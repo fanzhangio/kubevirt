@@ -161,6 +161,89 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 	}
 }
 
+func TestApplyNUMAHostDeviceTopologySingleGuestCellCollapsesHostNUMA(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		domain := strings.TrimPrefix(addr.Domain, "0x")
+		bus := strings.TrimPrefix(addr.Bus, "0x")
+		slot := strings.TrimPrefix(addr.Slot, "0x")
+		function := strings.TrimPrefix(addr.Function, "0x")
+		return fmt.Sprintf("%s:%s:%s.%s", domain, bus, slot, function), nil
+	}
+
+	getDeviceNumaNodeIntFunc = func(bdf string) (int, error) {
+		switch bdf {
+		case "0000:03:00.0", "0000:04:00.0":
+			return 0, nil
+		case "0000:83:00.0", "0000:84:00.0":
+			return 1, nil
+		default:
+			return -1, fmt.Errorf("unexpected bdf %s", bdf)
+		}
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			CPU: api.CPU{
+				NUMA: &api.NUMA{
+					Cells: []api.NUMACell{
+						{
+							ID:     "0",
+							CPUs:   "0-19",
+							Memory: 5242880,
+							Unit:   "KiB",
+						},
+					},
+				},
+			},
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+					newTestPCIHostDevice("gpu2", "0x0000", "0x04"),
+					newTestPCIHostDevice("gpu3", "0x0000", "0x83"),
+					newTestPCIHostDevice("gpu4", "0x0000", "0x84"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	var pxbCount int
+	rootPortBuses := make(map[string]struct{})
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-expander-bus" {
+			pxbCount++
+		}
+		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil {
+			rootPortBuses[ctrl.Address.Bus] = struct{}{}
+		}
+	}
+
+	if pxbCount != 1 {
+		t.Fatalf("expected 1 PXB controller when guest has a single NUMA cell, got %d", pxbCount)
+	}
+	if len(rootPortBuses) != 1 {
+		t.Fatalf("expected root ports to be attached to a single PXB bus, got %d buses", len(rootPortBuses))
+	}
+}
+
 func TestApplyNUMAHostDeviceTopologyHandlesMdev(t *testing.T) {
 	defer restoreNUMAHelpers()
 
@@ -226,6 +309,22 @@ func restoreNUMAHelpers() {
 	formatPCIAddressFunc = hardware.FormatPCIAddress
 	getDeviceNumaNodeIntFunc = hardware.GetDeviceNumaNodeInt
 	getMdevParentPCIAddressFunc = hardware.GetMdevParentPCIAddress
+}
+
+func newTestPCIHostDevice(name, domain, bus string) api.HostDevice {
+	return api.HostDevice{
+		Type: api.HostDevicePCI,
+		Source: api.HostDeviceSource{
+			Address: &api.Address{
+				Type:     api.AddressPCI,
+				Domain:   domain,
+				Bus:      bus,
+				Slot:     "0x00",
+				Function: "0x0",
+			},
+		},
+		Alias: api.NewUserDefinedAlias("hostdevice-" + name),
+	}
 }
 
 func containsInt(list []int, value int) bool {
