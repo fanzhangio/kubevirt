@@ -923,22 +923,22 @@ func TestApplyNUMAHostDeviceTopologyMultipleDevicesPerNode(t *testing.T) {
 
 	ApplyNUMAHostDeviceTopology(vmi, domain)
 
-	// Should create 2 PXB controllers (one per NUMA node)
+	// Should create one PXB controller per NUMA node
 	var pxbCount int
-	var numaNodes []int
+	nodeCounts := make(map[int]int)
 	for _, ctrl := range domain.Spec.Devices.Controllers {
 		if ctrl.Model == "pcie-expander-bus" {
 			pxbCount++
 			if ctrl.Target != nil && ctrl.Target.Node != nil {
-				numaNodes = append(numaNodes, *ctrl.Target.Node)
+				nodeCounts[*ctrl.Target.Node]++
 			}
 		}
 	}
 	if pxbCount != 2 {
-		t.Fatalf("expected 2 PXB controllers, got %d", pxbCount)
+		t.Fatalf("expected 2 PXB controllers (one per NUMA node), got %d", pxbCount)
 	}
-	if !(containsInt(numaNodes, 0) && containsInt(numaNodes, 1)) {
-		t.Fatalf("expected PXB controllers for NUMA nodes 0 and 1, got %v", numaNodes)
+	if nodeCounts[0] != 1 || nodeCounts[1] != 1 {
+		t.Fatalf("expected one PXB per NUMA node, got %v", nodeCounts)
 	}
 
 	// Should create 7 root ports per NUMA node (14 total)
@@ -1425,18 +1425,14 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 
 	ApplyNUMAHostDeviceTopology(vmi, domain)
 
-	// Verify PXB controllers are created for both NUMA nodes
+	// Verify PXB controllers are created per NUMA node and mapped to the right NUMA nodes
 	var pxbCount int
-	var numaNodes []int
-	var pxbSlots []string
+	nodeCounts := make(map[int]int)
 	for _, ctrl := range domain.Spec.Devices.Controllers {
 		if ctrl.Model == "pcie-expander-bus" {
 			pxbCount++
 			if ctrl.Target != nil && ctrl.Target.Node != nil {
-				numaNodes = append(numaNodes, *ctrl.Target.Node)
-			}
-			if ctrl.Address != nil {
-				pxbSlots = append(pxbSlots, ctrl.Address.Slot)
+				nodeCounts[*ctrl.Target.Node]++
 			}
 		}
 	}
@@ -1444,8 +1440,8 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 	if pxbCount != 2 {
 		t.Fatalf("expected 2 PXB controllers (one per NUMA node), got %d", pxbCount)
 	}
-	if !(containsInt(numaNodes, 0) && containsInt(numaNodes, 1)) {
-		t.Fatalf("expected PXB controllers for NUMA nodes 0 and 1, got %v", numaNodes)
+	if nodeCounts[0] != 1 || nodeCounts[1] != 1 {
+		t.Fatalf("expected one PXB per NUMA node, got %v", nodeCounts)
 	}
 
 	// Verify root ports are created (7 devices per NUMA node = 14 total root ports)

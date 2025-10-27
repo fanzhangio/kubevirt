@@ -49,7 +49,6 @@ type pxbInfo struct {
 	index         int
 	nextPortSlot  int
 	nextPortValue int
-	reusablePorts []*rootPortInfo
 }
 
 type rootPortInfo struct {
@@ -84,9 +83,19 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	}
 
 	planner := newNUMAPCIPlanner(domain)
-	grouped := make(map[int][]*api.HostDevice)
-	numaPrefetch := make(map[int]uint64)
-	numaPrefetchObserved := make(map[int]int)
+
+	type hostDevicePlan struct {
+		device        *api.HostDevice
+		prefetchBytes uint64
+		measured      bool
+	}
+	type nodePlan struct {
+		devices         []hostDevicePlan
+		measuredBytes   uint64
+		measuredDevices int
+	}
+
+	grouped := make(map[int]*nodePlan)
 	var totalPXBHoleGiB uint
 
 	for i := range hostDevices {
@@ -116,13 +125,25 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		} else {
 			log.Log.V(1).Infof("host device %s grouped to NUMA node %d", bdf, groupKey)
 		}
-		grouped[groupKey] = append(grouped[groupKey], dev)
+		plan := hostDevicePlan{device: dev}
 		prefetchSize, err := getDevicePrefetchable64Func(bdf)
 		if err != nil {
 			log.Log.V(1).Reason(err).Infof("unable to detect 64-bit prefetchable BAR size for host device %s, using fallback sizing", bdf)
+		} else if prefetchSize == 0 {
+			log.Log.V(1).Infof("host device %s reported zero 64-bit prefetchable BAR size, using fallback sizing", bdf)
 		} else {
-			numaPrefetch[groupKey] += prefetchSize
-			numaPrefetchObserved[groupKey]++
+			plan.prefetchBytes = prefetchSize
+			plan.measured = true
+		}
+		group := grouped[groupKey]
+		if group == nil {
+			group = &nodePlan{}
+			grouped[groupKey] = group
+		}
+		group.devices = append(group.devices, plan)
+		if plan.measured {
+			group.measuredBytes += plan.prefetchBytes
+			group.measuredDevices++
 		}
 	}
 
@@ -138,18 +159,19 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	slices.Sort(numaNodes)
 
 	for _, numaNode := range numaNodes {
-		devices := grouped[numaNode]
-		if len(devices) == 0 {
+		group := grouped[numaNode]
+		if group == nil || len(group.devices) == 0 {
 			continue
 		}
-		log.Log.V(1).Infof("setting up PCI expander bus for NUMA node %d with %d devices", numaNode, len(devices))
-		pxb, hole64GiB, err := planner.ensurePXBForNUMA(numaNode, len(devices), numaPrefetch[numaNode], numaPrefetchObserved[numaNode])
+		reservationGiB := calculateNodePXBHole64GiB(len(group.devices), group.measuredDevices, group.measuredBytes)
+		log.Log.V(1).Infof("setting up PCI expander bus for NUMA node %d with %d devices (reservation %d GiB)", numaNode, len(group.devices), reservationGiB)
+		pxb, hole64GiB, err := planner.ensurePXBForNUMA(numaNode, reservationGiB)
 		if err != nil {
 			log.Log.Reason(err).Errorf("failed to create PCI expander bus for NUMA node %d", numaNode)
 			continue
 		}
 		totalPXBHoleGiB += hole64GiB
-		for _, dev := range devices {
+		for _, plan := range group.devices {
 			rootPort, err := planner.addRootPort(pxb)
 			if err != nil {
 				log.Log.Reason(err).Error("failed to allocate root port for host device")
@@ -157,7 +179,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			}
 			// The planner hands out each PCIe root port controller a monotonically increasing index (starting from whatever the domain already used).
 			//  When we assign a host device to that root port we derive the downstream bus straight from that index:
-			assignHostDeviceToRootPort(dev, rootPort)
+			assignHostDeviceToRootPort(plan.device, rootPort)
 			log.Log.V(1).Infof("assigned host device to NUMA node %d bus %#02x", numaNode, rootPort.controllerIndex)
 		}
 	}
@@ -178,7 +200,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	}
 
 	maxIndex := -1
-	pxbByIndex := map[int]*pxbInfo{}
+	existingPXBs := map[int]*pxbInfo{}
 
 	for i := range domain.Spec.Devices.Controllers {
 		ctrl := domain.Spec.Devices.Controllers[i]
@@ -215,19 +237,18 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 			if err != nil {
 				continue
 			}
-
 			info := &pxbInfo{
 				index: indexVal,
 			}
 			planner.pxbs[nodeID] = info
-			pxbByIndex[indexVal] = info
+			existingPXBs[indexVal] = info
 
-			// Ensure slot bookkeeping honours already allocated root bus slots
 			if ctrl.Address != nil && ctrl.Address.Slot != "" {
 				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
 					if int(slotVal) >= planner.nextPXBSlot {
 						planner.nextPXBSlot = int(slotVal) + 1
 					}
+					info.nextPortSlot = 0
 				}
 			}
 			continue
@@ -238,19 +259,10 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 			if err != nil {
 				continue
 			}
-			info, ok := pxbByIndex[int(busVal)]
+			info, ok := existingPXBs[int(busVal)]
 			if !ok {
 				continue
 			}
-
-			controllerIndex, err := strconv.Atoi(ctrl.Index)
-			if err != nil {
-				continue
-			}
-			info.reusablePorts = append(info.reusablePorts, &rootPortInfo{
-				controllerIndex: controllerIndex,
-			})
-
 			if ctrl.Address.Slot != "" {
 				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
 					if slot := int(slotVal) + 1; slot > info.nextPortSlot {
@@ -258,7 +270,6 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 					}
 				}
 			}
-
 			if ctrl.Target != nil && ctrl.Target.Port != "" {
 				if portVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Target.Port, "0x"), 16, 32); err == nil {
 					if port := int(portVal) + 1; port > info.nextPortValue {
@@ -266,22 +277,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 					}
 				}
 			}
-
 			continue
-		}
-	}
-
-	for _, info := range planner.pxbs {
-		if info.nextPortSlot == 0 {
-			info.nextPortSlot = 0
-		}
-		if info.nextPortValue == 0 {
-			info.nextPortValue = 0
-		}
-		if len(info.reusablePorts) > 0 {
-			slices.SortFunc(info.reusablePorts, func(a, b *rootPortInfo) int {
-				return a.controllerIndex - b.controllerIndex
-			})
 		}
 	}
 
@@ -292,11 +288,11 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	return planner
 }
 
-func (p *numaPCIPlanner) ensurePXBForNUMA(numa int, deviceCount int, measuredPrefetch uint64, measuredDevices int) (*pxbInfo, uint, error) {
+func (p *numaPCIPlanner) ensurePXBForNUMA(numa int, reservationGiB uint) (*pxbInfo, uint, error) {
 	if existing, ok := p.pxbs[numa]; ok {
-		reservationGiB := calculatePXBHole64GiB(deviceCount, measuredDevices, measuredPrefetch)
 		return existing, reservationGiB, nil
 	}
+
 	index := p.nextControllerIndex
 	p.nextControllerIndex++
 
@@ -326,7 +322,6 @@ func (p *numaPCIPlanner) ensurePXBForNUMA(numa int, deviceCount int, measuredPre
 		},
 	}
 
-	reservationGiB := calculatePXBHole64GiB(deviceCount, measuredDevices, measuredPrefetch)
 	log.Log.V(1).Infof("NUMA node %d expander bus reserving %d GiB of 64-bit prefetchable MMIO space", numa, reservationGiB)
 
 	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
@@ -341,12 +336,6 @@ func (p *numaPCIPlanner) ensurePXBForNUMA(numa int, deviceCount int, measuredPre
 }
 
 func (p *numaPCIPlanner) addRootPort(info *pxbInfo) (*rootPortInfo, error) {
-	if len(info.reusablePorts) > 0 {
-		port := info.reusablePorts[0]
-		info.reusablePorts = info.reusablePorts[1:]
-		return port, nil
-	}
-
 	index := p.nextControllerIndex
 	p.nextControllerIndex++
 
@@ -464,7 +453,7 @@ func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Do
 	return len(domain.Spec.CPU.NUMA.Cells) <= 1
 }
 
-func calculatePXBHole64GiB(deviceCount, measuredDevices int, measuredPrefetch uint64) uint {
+func calculateNodePXBHole64GiB(deviceCount, measuredDevices int, measuredPrefetch uint64) uint {
 	if deviceCount <= 0 {
 		return uint(defaultPXBHole64GiB)
 	}
