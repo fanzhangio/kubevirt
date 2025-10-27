@@ -138,6 +138,20 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 		t.Fatalf("expected expander buses for NUMA nodes 0 and 1, got %v", numaNodes)
 	}
 
+	rootHole := uint(0)
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Type == "pci" && ctrl.Model == "pcie-root" {
+			rootHole = pciHole64ToGiB(ctrl.PCIHole64)
+			break
+		}
+	}
+	if rootHole < uint(defaultPXBHole64GiB) {
+		t.Fatalf("expected root complex 64-bit MMIO reservation to be at least %d GiB, got %d GiB", defaultPXBHole64GiB, rootHole)
+	}
+	if rootHole > uint(maxPXBHole64GiB) {
+		t.Fatalf("unexpectedly large root complex reservation %d GiB (max %d GiB)", rootHole, maxPXBHole64GiB)
+	}
+
 	rootPortControllers := make(map[string]struct{})
 	for _, ctrl := range domain.Spec.Devices.Controllers {
 		if ctrl.Model == "pcie-root-port" {
@@ -242,6 +256,17 @@ func TestApplyNUMAHostDeviceTopologySingleGuestCellCollapsesHostNUMA(t *testing.
 	if len(rootPortBuses) != 1 {
 		t.Fatalf("expected root ports to be attached to a single PXB bus, got %d buses", len(rootPortBuses))
 	}
+
+	rootHole := uint(0)
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Type == "pci" && ctrl.Model == "pcie-root" {
+			rootHole = pciHole64ToGiB(ctrl.PCIHole64)
+			break
+		}
+	}
+	if rootHole < uint(defaultPXBHole64GiB) {
+		t.Fatalf("expected root complex 64-bit MMIO reservation to be at least %d GiB, got %d GiB", defaultPXBHole64GiB, rootHole)
+	}
 }
 
 func TestApplyNUMAHostDeviceTopologyHandlesMdev(t *testing.T) {
@@ -309,6 +334,7 @@ func restoreNUMAHelpers() {
 	formatPCIAddressFunc = hardware.FormatPCIAddress
 	getDeviceNumaNodeIntFunc = hardware.GetDeviceNumaNodeInt
 	getMdevParentPCIAddressFunc = hardware.GetMdevParentPCIAddress
+	getDevicePrefetchable64Func = hardware.GetDevicePrefetchable64Size
 }
 
 func newTestPCIHostDevice(name, domain, bus string) api.HostDevice {
@@ -931,6 +957,76 @@ func TestApplyNUMAHostDeviceTopologyMultipleDevicesPerNode(t *testing.T) {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
 		}
+	}
+}
+
+func TestApplyNUMAHostDeviceTopologyReservesMeasuredPrefetchSpace(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		domain := strings.TrimPrefix(addr.Domain, "0x")
+		bus := strings.TrimPrefix(addr.Bus, "0x")
+		slot := strings.TrimPrefix(addr.Slot, "0x")
+		function := strings.TrimPrefix(addr.Function, "0x")
+		return fmt.Sprintf("%s:%s:%s.%s", domain, bus, slot, function), nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) {
+		return 0, nil
+	}
+
+	sizes := map[string]uint64{
+		"0000:03:00.0": 128 << 30,
+		"0000:04:00.0": 64 << 30,
+	}
+	getDevicePrefetchable64Func = func(bdf string) (uint64, error) {
+		if size, ok := sizes[bdf]; ok {
+			return size, nil
+		}
+		return 0, fmt.Errorf("unexpected bdf %s", bdf)
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+					newTestPCIHostDevice("gpu2", "0x0000", "0x04"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	var rootHole uint
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Type == "pci" && ctrl.Model == "pcie-root" {
+			rootHole = pciHole64ToGiB(ctrl.PCIHole64)
+			break
+		}
+	}
+	if rootHole == 0 {
+		t.Fatalf("expected to find a root 64-bit MMIO reservation value")
+	}
+
+	expected := uint(208)
+	if rootHole != expected {
+		t.Fatalf("expected root reservation %d GiB, got %d GiB", expected, rootHole)
 	}
 }
 

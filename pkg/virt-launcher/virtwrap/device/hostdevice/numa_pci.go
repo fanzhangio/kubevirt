@@ -19,12 +19,20 @@ const (
 	maxRootBusSlot   = 0x1f
 	maxRootPortSlot  = 0x1f
 	unifiedNUMAGroup = 0
+
+	defaultPXBHole64GiB          = 64
+	fallbackPrefetchPerDeviceGiB = 32
+	pxbPrefetchHeadroomGiB       = 16
+	maxPXBHole64GiB              = 512
 )
+
+const gibibyte = uint64(1 << 30)
 
 var (
 	formatPCIAddressFunc        = hardware.FormatPCIAddress
 	getDeviceNumaNodeIntFunc    = hardware.GetDeviceNumaNodeInt
 	getMdevParentPCIAddressFunc = hardware.GetMdevParentPCIAddress
+	getDevicePrefetchable64Func = hardware.GetDevicePrefetchable64Size
 )
 
 type numaPCIPlanner struct {
@@ -41,6 +49,7 @@ type pxbInfo struct {
 	index         int
 	nextPortSlot  int
 	nextPortValue int
+	reusablePorts []*rootPortInfo
 }
 
 type rootPortInfo struct {
@@ -76,6 +85,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 
 	planner := newNUMAPCIPlanner(domain)
 	grouped := make(map[int][]*api.HostDevice)
+	numaPrefetch := make(map[int]uint64)
+	numaPrefetchObserved := make(map[int]int)
+	var totalPXBHoleGiB uint
 
 	for i := range hostDevices {
 		dev := &domain.Spec.Devices.HostDevices[i]
@@ -105,6 +117,13 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			log.Log.V(1).Infof("host device %s grouped to NUMA node %d", bdf, groupKey)
 		}
 		grouped[groupKey] = append(grouped[groupKey], dev)
+		prefetchSize, err := getDevicePrefetchable64Func(bdf)
+		if err != nil {
+			log.Log.V(1).Reason(err).Infof("unable to detect 64-bit prefetchable BAR size for host device %s, using fallback sizing", bdf)
+		} else {
+			numaPrefetch[groupKey] += prefetchSize
+			numaPrefetchObserved[groupKey]++
+		}
 	}
 
 	if len(grouped) == 0 {
@@ -124,11 +143,12 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			continue
 		}
 		log.Log.V(1).Infof("setting up PCI expander bus for NUMA node %d with %d devices", numaNode, len(devices))
-		pxb, err := planner.ensurePXBForNUMA(numaNode)
+		pxb, hole64GiB, err := planner.ensurePXBForNUMA(numaNode, len(devices), numaPrefetch[numaNode], numaPrefetchObserved[numaNode])
 		if err != nil {
 			log.Log.Reason(err).Errorf("failed to create PCI expander bus for NUMA node %d", numaNode)
 			continue
 		}
+		totalPXBHoleGiB += hole64GiB
 		for _, dev := range devices {
 			rootPort, err := planner.addRootPort(pxb)
 			if err != nil {
@@ -140,6 +160,10 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			assignHostDeviceToRootPort(dev, rootPort)
 			log.Log.V(1).Infof("assigned host device to NUMA node %d bus %#02x", numaNode, rootPort.controllerIndex)
 		}
+	}
+
+	if totalPXBHoleGiB > 0 {
+		ensureRootPCIHole64(planner.domain, totalPXBHoleGiB)
 	}
 }
 
@@ -154,6 +178,8 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	}
 
 	maxIndex := -1
+	pxbByIndex := map[int]*pxbInfo{}
+
 	for i := range domain.Spec.Devices.Controllers {
 		ctrl := domain.Spec.Devices.Controllers[i]
 		if idx, err := strconv.Atoi(ctrl.Index); err == nil && idx > maxIndex {
@@ -179,6 +205,84 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 				}
 			}
 		}
+
+		if ctrl.Model == "pcie-expander-bus" {
+			if ctrl.Target == nil || ctrl.Target.Node == nil {
+				continue
+			}
+			nodeID := *ctrl.Target.Node
+			indexVal, err := strconv.Atoi(ctrl.Index)
+			if err != nil {
+				continue
+			}
+
+			info := &pxbInfo{
+				index: indexVal,
+			}
+			planner.pxbs[nodeID] = info
+			pxbByIndex[indexVal] = info
+
+			// Ensure slot bookkeeping honours already allocated root bus slots
+			if ctrl.Address != nil && ctrl.Address.Slot != "" {
+				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
+					if int(slotVal) >= planner.nextPXBSlot {
+						planner.nextPXBSlot = int(slotVal) + 1
+					}
+				}
+			}
+			continue
+		}
+
+		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil {
+			busVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Bus, "0x"), 16, 32)
+			if err != nil {
+				continue
+			}
+			info, ok := pxbByIndex[int(busVal)]
+			if !ok {
+				continue
+			}
+
+			controllerIndex, err := strconv.Atoi(ctrl.Index)
+			if err != nil {
+				continue
+			}
+			info.reusablePorts = append(info.reusablePorts, &rootPortInfo{
+				controllerIndex: controllerIndex,
+			})
+
+			if ctrl.Address.Slot != "" {
+				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
+					if slot := int(slotVal) + 1; slot > info.nextPortSlot {
+						info.nextPortSlot = slot
+					}
+				}
+			}
+
+			if ctrl.Target != nil && ctrl.Target.Port != "" {
+				if portVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Target.Port, "0x"), 16, 32); err == nil {
+					if port := int(portVal) + 1; port > info.nextPortValue {
+						info.nextPortValue = port
+					}
+				}
+			}
+
+			continue
+		}
+	}
+
+	for _, info := range planner.pxbs {
+		if info.nextPortSlot == 0 {
+			info.nextPortSlot = 0
+		}
+		if info.nextPortValue == 0 {
+			info.nextPortValue = 0
+		}
+		if len(info.reusablePorts) > 0 {
+			slices.SortFunc(info.reusablePorts, func(a, b *rootPortInfo) int {
+				return a.controllerIndex - b.controllerIndex
+			})
+		}
 	}
 
 	planner.nextControllerIndex = maxIndex + 1
@@ -188,16 +292,17 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	return planner
 }
 
-func (p *numaPCIPlanner) ensurePXBForNUMA(numa int) (*pxbInfo, error) {
+func (p *numaPCIPlanner) ensurePXBForNUMA(numa int, deviceCount int, measuredPrefetch uint64, measuredDevices int) (*pxbInfo, uint, error) {
 	if existing, ok := p.pxbs[numa]; ok {
-		return existing, nil
+		reservationGiB := calculatePXBHole64GiB(deviceCount, measuredDevices, measuredPrefetch)
+		return existing, reservationGiB, nil
 	}
 	index := p.nextControllerIndex
 	p.nextControllerIndex++
 
 	slot := p.allocateRootSlot()
 	if slot < 0 {
-		return nil, fmt.Errorf("no slots available for PCI expander bus")
+		return nil, 0, fmt.Errorf("no slots available for PCI expander bus")
 	}
 
 	nodeVal := numa
@@ -221,6 +326,9 @@ func (p *numaPCIPlanner) ensurePXBForNUMA(numa int) (*pxbInfo, error) {
 		},
 	}
 
+	reservationGiB := calculatePXBHole64GiB(deviceCount, measuredDevices, measuredPrefetch)
+	log.Log.V(1).Infof("NUMA node %d expander bus reserving %d GiB of 64-bit prefetchable MMIO space", numa, reservationGiB)
+
 	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
 
 	info := &pxbInfo{
@@ -229,10 +337,16 @@ func (p *numaPCIPlanner) ensurePXBForNUMA(numa int) (*pxbInfo, error) {
 		nextPortValue: 0,
 	}
 	p.pxbs[numa] = info
-	return info, nil
+	return info, reservationGiB, nil
 }
 
 func (p *numaPCIPlanner) addRootPort(info *pxbInfo) (*rootPortInfo, error) {
+	if len(info.reusablePorts) > 0 {
+		port := info.reusablePorts[0]
+		info.reusablePorts = info.reusablePorts[1:]
+		return port, nil
+	}
+
 	index := p.nextControllerIndex
 	p.nextControllerIndex++
 
@@ -348,4 +462,110 @@ func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Do
 	}
 
 	return len(domain.Spec.CPU.NUMA.Cells) <= 1
+}
+
+func calculatePXBHole64GiB(deviceCount, measuredDevices int, measuredPrefetch uint64) uint {
+	if deviceCount <= 0 {
+		return uint(defaultPXBHole64GiB)
+	}
+
+	requiredBytes := measuredPrefetch
+	if missing := deviceCount - measuredDevices; missing > 0 {
+		requiredBytes += uint64(missing) * uint64(fallbackPrefetchPerDeviceGiB) * gibibyte
+	}
+
+	requiredGiB := defaultPXBHole64GiB
+	if requiredBytes > 0 {
+		computed := bytesToGiBCeil(requiredBytes)
+		computed += pxbPrefetchHeadroomGiB
+		if computed > requiredGiB {
+			requiredGiB = computed
+		}
+	}
+
+	if requiredGiB > maxPXBHole64GiB {
+		requiredGiB = maxPXBHole64GiB
+	}
+
+	return uint(requiredGiB)
+}
+
+func bytesToGiBCeil(value uint64) int {
+	if value == 0 {
+		return 0
+	}
+	return int((value + gibibyte - 1) / gibibyte)
+}
+
+func ensureRootPCIHole64(domain *api.Domain, requiredGiB uint) {
+	if domain == nil || requiredGiB == 0 {
+		return
+	}
+
+	var root *api.Controller
+	for i := range domain.Spec.Devices.Controllers {
+		ctrl := &domain.Spec.Devices.Controllers[i]
+		if ctrl.Type == "pci" && ctrl.Model == "pcie-root" {
+			root = ctrl
+			break
+		}
+	}
+	if root == nil {
+		// libvirt will implicitly create the root controller if it is absent.
+		// However, when we need to reserve additional 64-bit MMIO space we must materialize it up-front.
+		rootController := api.Controller{
+			Type:  "pci",
+			Index: "0",
+			Model: "pcie-root",
+			Alias: api.NewUserDefinedAlias("pcie.0"),
+		}
+		domain.Spec.Devices.Controllers = append([]api.Controller{rootController}, domain.Spec.Devices.Controllers...)
+		root = &domain.Spec.Devices.Controllers[0]
+		log.Log.V(1).Info("pcie-root controller materialized to expand 64-bit MMIO aperture")
+	} else if root.Alias == nil {
+		// Normalise alias to keep parity with libvirt auto-generated domains.
+		root.Alias = api.NewUserDefinedAlias("pcie.0")
+	}
+
+	existingGiB := pciHole64ToGiB(root.PCIHole64)
+	if existingGiB >= requiredGiB {
+		return
+	}
+
+	requiredKiB := requiredGiB * 1024 * 1024
+	root.PCIHole64 = &api.PCIHole64{
+		Value: requiredKiB,
+		Unit:  "KiB",
+	}
+	log.Log.V(1).Infof("root complex 64-bit MMIO aperture expanded to %d GiB for NUMA host devices", requiredGiB)
+}
+
+func pciHole64ToGiB(value *api.PCIHole64) uint {
+	if value == nil {
+		return 0
+	}
+
+	unit := strings.ToLower(value.Unit)
+	switch unit {
+	case "":
+		return uint(bytesToGiBCeil(uint64(value.Value)))
+	case "bytes":
+		return uint(bytesToGiBCeil(uint64(value.Value)))
+	case "kib":
+		return uint(bytesToGiBCeil(uint64(value.Value) * 1024))
+	case "kibibytes":
+		return uint(bytesToGiBCeil(uint64(value.Value) * 1024))
+	case "mib", "mibibytes":
+		return uint(bytesToGiBCeil(uint64(value.Value) * 1024 * 1024))
+	case "gib", "gibibytes":
+		return value.Value
+	case "kb":
+		return uint(bytesToGiBCeil(uint64(value.Value) * 1000))
+	case "mb":
+		return uint(bytesToGiBCeil(uint64(value.Value) * 1000 * 1000))
+	case "gb":
+		return uint(bytesToGiBCeil(uint64(value.Value) * 1000 * 1000 * 1000))
+	default:
+		return uint(bytesToGiBCeil(uint64(value.Value)))
+	}
 }

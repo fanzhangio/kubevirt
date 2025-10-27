@@ -22,6 +22,7 @@ package hardware
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -187,6 +188,48 @@ var _ = Describe("Hardware utils test", func() {
 			Expect(os.Symlink(target, filepath.Join(mdevDir, "mdev_type"))).To(Succeed())
 
 			_, err := GetMdevParentPCIAddress(uuid)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Context("prefetchable 64-bit resource sizing", func() {
+		var (
+			tmpDir  string
+			oldBase string
+		)
+
+		BeforeEach(func() {
+			var err error
+			tmpDir, err = os.MkdirTemp("", "kubevirt-pci-*")
+			Expect(err).ToNot(HaveOccurred())
+			oldBase = pciDevicesBasePath
+			pciDevicesBasePath = tmpDir
+		})
+
+		AfterEach(func() {
+			pciDevicesBasePath = oldBase
+			Expect(os.RemoveAll(tmpDir)).To(Succeed())
+		})
+
+		It("sums 64-bit prefetchable BAR sizes", func() {
+			deviceDir := filepath.Join(tmpDir, "0000:01:00.0")
+			Expect(os.MkdirAll(deviceDir, 0o755)).To(Succeed())
+
+			resourceContent := strings.Join([]string{
+				"0x0000000000001000 0x0000000000001fff 0x00000200",
+				"0x0000000000002000 0x0000000000002fff 0x00102200",
+				"0x0000000000003000 0x0000000000003fff 0x00102200",
+				"0x0000000000004000 0x0000000000004fff 0x00002200",
+			}, "\n")
+			Expect(os.WriteFile(filepath.Join(deviceDir, "resource"), []byte(resourceContent), 0o644)).To(Succeed())
+
+			size, err := GetDevicePrefetchable64Size("0000:01:00.0")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(size).To(Equal(uint64(0x2000)))
+		})
+
+		It("returns error when resource file missing", func() {
+			_, err := GetDevicePrefetchable64Size("0000:02:00.0")
 			Expect(err).To(HaveOccurred())
 		})
 	})

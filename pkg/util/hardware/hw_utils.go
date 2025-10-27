@@ -20,6 +20,7 @@
 package hardware
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
@@ -35,10 +36,15 @@ import (
 
 const (
 	PCI_ADDRESS_PATTERN = `^([\da-fA-F]{4}):([\da-fA-F]{2}):([\da-fA-F]{2})\.([0-7]{1})$`
+
+	ioResourceMem      = 0x00000200
+	ioResourcePrefetch = 0x00002000
+	ioResourceMem64    = 0x00100000
 )
 
 var (
 	mdevDevicesBasePath = "/sys/bus/mdev/devices"
+	pciDevicesBasePath  = "/sys/bus/pci/devices"
 )
 
 // Parse linux cpuset into an array of ints
@@ -183,8 +189,7 @@ func GetDeviceNumaNode(pciAddress string) (*uint32, error) {
 }
 
 func GetDeviceNumaNodeInt(pciAddress string) (int, error) {
-	pciBasePath := "/sys/bus/pci/devices"
-	numaNodePath := filepath.Join(pciBasePath, pciAddress, "numa_node")
+	numaNodePath := filepath.Join(pciDevicesBasePath, pciAddress, "numa_node")
 	// #nosec No risk for path injection. Reading static path of NUMA node info
 	numaNodeStr, err := os.ReadFile(numaNodePath)
 	if err != nil {
@@ -196,6 +201,58 @@ func GetDeviceNumaNodeInt(pciAddress string) (int, error) {
 		return -1, err
 	}
 	return numaNodeInt, nil
+}
+
+func GetDevicePrefetchable64Size(pciAddress string) (uint64, error) {
+	resourcePath := filepath.Join(pciDevicesBasePath, pciAddress, "resource")
+	file, err := os.Open(resourcePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	var total uint64
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+
+		start, err := strconv.ParseUint(strings.TrimPrefix(fields[0], "0x"), 16, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse resource start for %s: %w", pciAddress, err)
+		}
+		end, err := strconv.ParseUint(strings.TrimPrefix(fields[1], "0x"), 16, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse resource end for %s: %w", pciAddress, err)
+		}
+		flags, err := strconv.ParseUint(strings.TrimPrefix(fields[2], "0x"), 16, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse resource flags for %s: %w", pciAddress, err)
+		}
+
+		if flags&ioResourceMem == 0 {
+			continue
+		}
+		if flags&ioResourcePrefetch == 0 {
+			continue
+		}
+		if flags&ioResourceMem64 == 0 {
+			continue
+		}
+		if end < start {
+			continue
+		}
+
+		total += (end - start + 1)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+
+	return total, nil
 }
 
 func GetDeviceAlignedCPUs(pciAddress string) ([]int, error) {
