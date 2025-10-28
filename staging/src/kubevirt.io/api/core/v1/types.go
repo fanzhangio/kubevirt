@@ -1381,6 +1381,9 @@ const (
 	// DisablePCIHole64 indicates that the 64-Bit PCI hole should be disabled on a VirtualMachineInstance.
 	// This annotation might be deprecated in the future if we decided to add a struct for it.
 	DisablePCIHole64 string = "kubevirt.io/disablePCIHole64"
+
+	// NUMAHostDevicePXBHoleGiB allows overriding the fallback per-device prefetchable 64-Bit MMIO reservation (GiB) used by the NUMA host device planner.
+	NUMAHostDevicePXBHoleGiB string = "kubevirt.io/numaHostDevicePXBHoleGiB"
 )
 
 func NewVMI(name string, uid types.UID) *VirtualMachineInstance {

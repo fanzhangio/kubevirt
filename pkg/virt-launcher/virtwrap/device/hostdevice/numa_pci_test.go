@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "kubevirt.io/api/core/v1"
 
 	"kubevirt.io/kubevirt/pkg/util/hardware"
@@ -1028,6 +1029,118 @@ func TestApplyNUMAHostDeviceTopologyReservesMeasuredPrefetchSpace(t *testing.T) 
 	if rootHole != expected {
 		t.Fatalf("expected root reservation %d GiB, got %d GiB", expected, rootHole)
 	}
+}
+
+func TestApplyNUMAHostDeviceTopologyCustomFallbackAnnotation(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	getDevicePrefetchable64Func = func(string) (uint64, error) {
+		return 0, fmt.Errorf("measurement unavailable")
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) {
+		return 0, nil
+	}
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		return fmt.Sprintf("0000:%s:%s.%s", strings.TrimPrefix(addr.Bus, "0x"), strings.TrimPrefix(addr.Slot, "0x"), strings.TrimPrefix(addr.Function, "0x")), nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				v1.NUMAHostDevicePXBHoleGiB: "96",
+			},
+		},
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+					newTestPCIHostDevice("gpu2", "0x0000", "0x04"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	var rootHole uint
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Type == "pci" && ctrl.Model == "pcie-root" {
+			rootHole = pciHole64ToGiB(ctrl.PCIHole64)
+			break
+		}
+	}
+	if rootHole != 208 {
+		t.Fatalf("expected root reservation 208 GiB with custom fallback, got %d GiB", rootHole)
+	}
+}
+
+func TestApplyNUMAHostDeviceTopologyDisableRootPCIHoleAnnotation(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	getDevicePrefetchable64Func = func(string) (uint64, error) {
+		return 32 << 30, nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) {
+		return 0, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				v1.DisablePCIHole64: "true",
+			},
+		},
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+					newTestPCIHostDevice("gpu2", "0x0000", "0x04"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Type == "pci" && ctrl.Model == "pcie-root" {
+			if ctrl.PCIHole64 != nil {
+				t.Fatalf("expected root PCI hole to remain unset when %s annotation is true", v1.DisablePCIHole64)
+			}
+			return
+		}
+	}
+	t.Fatalf("root PCI controller not found")
 }
 
 // Controller Management Tests

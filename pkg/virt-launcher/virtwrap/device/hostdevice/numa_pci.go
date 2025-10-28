@@ -62,7 +62,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	log.Log.V(1).Info("evaluating host device NUMA topology passthrough")
 	// Host devcies NUMA passthrough only works when CPU NUMA passthrough is enabled
 	// because without CPU NUMA passthrough, there will be only one NUMA node in the guest
-	// so all host devices will be assigned to the same NUMA node.
+	// TODO: (fanzhangio) when NUMA PCI passthrough feature is enabled,
+	// should we consider collapsing all host device NUMA nodes into the single guest NUMA node
+	// so all host devices will be assigned to the same NUMA node, even though they are from different host NUMA nodes?
 	if vmi.Spec.Domain.CPU == nil ||
 		vmi.Spec.Domain.CPU.NUMA == nil ||
 		vmi.Spec.Domain.CPU.NUMA.GuestMappingPassthrough == nil {
@@ -83,6 +85,11 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	}
 
 	planner := newNUMAPCIPlanner(domain)
+
+	fallbackGiB := fallbackPrefetchPerDeviceGiBFromAnnotation(vmi)
+	if fallbackGiB != fallbackPrefetchPerDeviceGiB {
+		log.Log.V(1).Infof("NUMA host device topology: custom per-device fallback reservation %d GiB (default %d GiB)", fallbackGiB, fallbackPrefetchPerDeviceGiB)
+	}
 
 	type hostDevicePlan struct {
 		device        *api.HostDevice
@@ -128,9 +135,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		plan := hostDevicePlan{device: dev}
 		prefetchSize, err := getDevicePrefetchable64Func(bdf)
 		if err != nil {
-			log.Log.V(1).Reason(err).Infof("unable to detect 64-bit prefetchable BAR size for host device %s, using fallback sizing", bdf)
+			log.Log.V(1).Reason(err).Infof("unable to detect 64-bit prefetchable BAR size for host device %s, using fallback sizing (fallback=%d GiB)", bdf, fallbackGiB)
 		} else if prefetchSize == 0 {
-			log.Log.V(1).Infof("host device %s reported zero 64-bit prefetchable BAR size, using fallback sizing", bdf)
+			log.Log.V(1).Infof("host device %s reported zero 64-bit prefetchable BAR size, using fallback sizing (fallback=%d GiB)", bdf, fallbackGiB)
 		} else {
 			plan.prefetchBytes = prefetchSize
 			plan.measured = true
@@ -163,8 +170,10 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		if group == nil || len(group.devices) == 0 {
 			continue
 		}
-		reservationGiB := calculateNodePXBHole64GiB(len(group.devices), group.measuredDevices, group.measuredBytes)
-		log.Log.V(1).Infof("setting up PCI expander bus for NUMA node %d with %d devices (reservation %d GiB)", numaNode, len(group.devices), reservationGiB)
+		reservationGiB := calculateNodePXBHole64GiB(len(group.devices), group.measuredDevices, group.measuredBytes, fallbackGiB)
+		measuredGiB := bytesToGiBCeil(group.measuredBytes)
+		log.Log.V(1).Infof("NUMA node %d aggregated prefetchable MMIO: %d GiB across %d/%d devices, fallback=%d GiB -> reservation=%d GiB",
+			numaNode, measuredGiB, group.measuredDevices, len(group.devices), fallbackGiB, reservationGiB)
 		pxb, hole64GiB, err := planner.ensurePXBForNUMA(numaNode, reservationGiB)
 		if err != nil {
 			log.Log.Reason(err).Errorf("failed to create PCI expander bus for NUMA node %d", numaNode)
@@ -185,6 +194,10 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	}
 
 	if totalPXBHoleGiB > 0 {
+		if isAnnotationTruthy(vmi, v1.DisablePCIHole64) {
+			log.Log.V(1).Infof("skipping root 64-bit MMIO aperture expansion: disabled via annotation %s", v1.DisablePCIHole64)
+			return
+		}
 		ensureRootPCIHole64(planner.domain, totalPXBHoleGiB)
 	}
 }
@@ -453,14 +466,14 @@ func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Do
 	return len(domain.Spec.CPU.NUMA.Cells) <= 1
 }
 
-func calculateNodePXBHole64GiB(deviceCount, measuredDevices int, measuredPrefetch uint64) uint {
+func calculateNodePXBHole64GiB(deviceCount, measuredDevices int, measuredPrefetch uint64, fallbackGiB uint) uint {
 	if deviceCount <= 0 {
 		return uint(defaultPXBHole64GiB)
 	}
 
 	requiredBytes := measuredPrefetch
 	if missing := deviceCount - measuredDevices; missing > 0 {
-		requiredBytes += uint64(missing) * uint64(fallbackPrefetchPerDeviceGiB) * gibibyte
+		requiredBytes += uint64(missing) * uint64(fallbackGiB) * gibibyte
 	}
 
 	requiredGiB := defaultPXBHole64GiB
@@ -527,6 +540,50 @@ func ensureRootPCIHole64(domain *api.Domain, requiredGiB uint) {
 		Unit:  "KiB",
 	}
 	log.Log.V(1).Infof("root complex 64-bit MMIO aperture expanded to %d GiB for NUMA host devices", requiredGiB)
+}
+
+// Supporting kubevirt.io/numaHostDevicePXBHoleGiB annotation to specify per-device reservation
+func fallbackPrefetchPerDeviceGiBFromAnnotation(vmi *v1.VirtualMachineInstance) uint {
+	if vmi == nil || vmi.Annotations == nil {
+		return fallbackPrefetchPerDeviceGiB
+	}
+
+	if raw, ok := vmi.Annotations[v1.NUMAHostDevicePXBHoleGiB]; ok {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return fallbackPrefetchPerDeviceGiB
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			log.Log.Reason(err).Warningf("invalid %s annotation value %q, using default %d GiB", v1.NUMAHostDevicePXBHoleGiB, value, fallbackPrefetchPerDeviceGiB)
+			return fallbackPrefetchPerDeviceGiB
+		}
+		if parsed < 0 {
+			log.Log.Warningf("negative %s annotation value %d ignored, using default %d GiB", v1.NUMAHostDevicePXBHoleGiB, parsed, fallbackPrefetchPerDeviceGiB)
+			return fallbackPrefetchPerDeviceGiB
+		}
+		return uint(parsed)
+	}
+	return fallbackPrefetchPerDeviceGiB
+}
+
+func isAnnotationTruthy(vmi *v1.VirtualMachineInstance, key string) bool {
+	if vmi == nil || vmi.Annotations == nil {
+		return false
+	}
+	value, ok := vmi.Annotations[key]
+	if !ok {
+		return false
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	boolVal, err := strconv.ParseBool(value)
+	if err == nil {
+		return boolVal
+	}
+	return strings.EqualFold(value, "enabled")
 }
 
 func pciHole64ToGiB(value *api.PCIHole64) uint {
