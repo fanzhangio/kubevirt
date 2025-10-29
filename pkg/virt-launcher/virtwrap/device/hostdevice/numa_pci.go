@@ -47,6 +47,12 @@ type rootPortInfo struct {
 	controllerIndex int
 }
 
+type deviceNUMAInfo struct {
+	dev      *api.HostDevice
+	numaNode int
+	bdf      string
+}
+
 func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Domain) {
 	if vmi == nil || domain == nil {
 		return
@@ -69,13 +75,10 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	}
 
 	log.Log.V(1).Infof("NUMA host device topology: processing %d host devices", len(hostDevices))
-	collapseNUMA := shouldCollapseHostDeviceNUMA(vmi, domain)
-	if collapseNUMA {
-		log.Log.V(1).Info("collapsing host device NUMA groups to a single guest NUMA node")
-	}
 
 	planner := newNUMAPCIPlanner(domain)
-	grouped := make(map[int][]*api.HostDevice)
+	devicesWithNUMA := make([]deviceNUMAInfo, 0, len(hostDevices))
+	hostNUMANodes := make(map[int]struct{})
 
 	for i := range hostDevices {
 		dev := &domain.Spec.Devices.HostDevices[i]
@@ -97,19 +100,34 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			}
 			continue
 		}
-		groupKey := numaNode
-		if collapseNUMA {
-			log.Log.V(1).Infof("host device %s (host NUMA %d) collapsed to guest NUMA group %d", bdf, numaNode, unifiedNUMAGroup)
-			groupKey = unifiedNUMAGroup
-		} else {
-			log.Log.V(1).Infof("host device %s grouped to NUMA node %d", bdf, groupKey)
-		}
-		grouped[groupKey] = append(grouped[groupKey], dev)
+		devicesWithNUMA = append(devicesWithNUMA, deviceNUMAInfo{
+			dev:      dev,
+			numaNode: numaNode,
+			bdf:      bdf,
+		})
+		hostNUMANodes[numaNode] = struct{}{}
 	}
 
-	if len(grouped) == 0 {
+	if len(devicesWithNUMA) == 0 {
 		log.Log.V(1).Info("NUMA host device topology not applied: no devices with NUMA affinity detected")
 		return
+	}
+
+	collapseNUMA := shouldCollapseHostDeviceNUMA(vmi, domain, hostNUMANodes)
+	if collapseNUMA {
+		log.Log.V(1).Info("collapsing host device NUMA groups to a single guest NUMA node")
+	}
+
+	grouped := make(map[int][]*api.HostDevice)
+	for _, info := range devicesWithNUMA {
+		groupKey := info.numaNode
+		if collapseNUMA {
+			log.Log.V(1).Infof("host device %s (host NUMA %d) collapsed to guest NUMA group %d", info.bdf, info.numaNode, unifiedNUMAGroup)
+			groupKey = unifiedNUMAGroup
+		} else {
+			log.Log.V(1).Infof("host device %s grouped to NUMA node %d", info.bdf, groupKey)
+		}
+		grouped[groupKey] = append(grouped[groupKey], info.dev)
 	}
 
 	numaNodes := make([]int, 0, len(grouped))
@@ -333,12 +351,11 @@ func resolveHostDevicePCIAddress(dev *api.HostDevice) (string, error) {
 }
 
 // shouldCollapseHostDeviceNUMA returns true when PCI host devices should all be mapped to a single
-// guest NUMA node. This happens when CPU NUMA passthrough is enabled (already validated by the caller)
-// but the converter produced only one guest NUMA cell (for example cpumanager pinned every vCPU to the
-// same host NUMA cell). We rely on the converter to populate domain.Spec.CPU.NUMA after vCPU pinning;
-// if this helper runs earlier in the pipeline we intentionally fall back to per-host NUMA grouping to
-// preserve behaviour.
-func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Domain) bool {
+// guest NUMA node. This happens when CPU NUMA passthrough is enabled (already validated by the caller),
+// the converter produced only one guest NUMA cell, and every host device being considered already
+// resides on the unified group (node 0). In all other cases we preserve the original host NUMA
+// placement to avoid breaking locality expectations from VFIO / IOMMU mappings.
+func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Domain, hostNUMANodes map[int]struct{}) bool {
 	if vmi == nil || domain == nil {
 		return false
 	}
@@ -347,5 +364,14 @@ func shouldCollapseHostDeviceNUMA(vmi *v1.VirtualMachineInstance, domain *api.Do
 		return false
 	}
 
-	return len(domain.Spec.CPU.NUMA.Cells) <= 1
+	if len(domain.Spec.CPU.NUMA.Cells) > 1 {
+		return false
+	}
+
+	if len(hostNUMANodes) != 1 {
+		return false
+	}
+
+	_, onlyNodeZero := hostNUMANodes[unifiedNUMAGroup]
+	return onlyNodeZero
 }

@@ -161,7 +161,7 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 	}
 }
 
-func TestApplyNUMAHostDeviceTopologySingleGuestCellCollapsesHostNUMA(t *testing.T) {
+func TestApplyNUMAHostDeviceTopologySingleGuestCellPreservesHostNUMA(t *testing.T) {
 	defer restoreNUMAHelpers()
 
 	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
@@ -226,21 +226,28 @@ func TestApplyNUMAHostDeviceTopologySingleGuestCellCollapsesHostNUMA(t *testing.
 	ApplyNUMAHostDeviceTopology(vmi, domain)
 
 	var pxbCount int
+	var numaNodes []int
 	rootPortBuses := make(map[string]struct{})
 	for _, ctrl := range domain.Spec.Devices.Controllers {
 		if ctrl.Model == "pcie-expander-bus" {
 			pxbCount++
+			if ctrl.Target != nil && ctrl.Target.Node != nil {
+				numaNodes = append(numaNodes, *ctrl.Target.Node)
+			}
 		}
 		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil {
 			rootPortBuses[ctrl.Address.Bus] = struct{}{}
 		}
 	}
 
-	if pxbCount != 1 {
-		t.Fatalf("expected 1 PXB controller when guest has a single NUMA cell, got %d", pxbCount)
+	if pxbCount != 2 {
+		t.Fatalf("expected 2 PXB controllers when devices span multiple host NUMA nodes, got %d", pxbCount)
 	}
-	if len(rootPortBuses) != 1 {
-		t.Fatalf("expected root ports to be attached to a single PXB bus, got %d buses", len(rootPortBuses))
+	if !(containsInt(numaNodes, 0) && containsInt(numaNodes, 1)) {
+		t.Fatalf("expected PXB controllers for NUMA nodes 0 and 1, got %v", numaNodes)
+	}
+	if len(rootPortBuses) != 2 {
+		t.Fatalf("expected root ports to be attached to two PXB buses, got %d buses", len(rootPortBuses))
 	}
 }
 
