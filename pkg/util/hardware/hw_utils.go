@@ -39,6 +39,7 @@ const (
 
 var (
 	mdevDevicesBasePath = "/sys/bus/mdev/devices"
+	pciDevicesBasePath  = "/sys/bus/pci/devices"
 )
 
 // Parse linux cpuset into an array of ints
@@ -183,8 +184,7 @@ func GetDeviceNumaNode(pciAddress string) (*uint32, error) {
 }
 
 func GetDeviceNumaNodeInt(pciAddress string) (int, error) {
-	pciBasePath := "/sys/bus/pci/devices"
-	numaNodePath := filepath.Join(pciBasePath, pciAddress, "numa_node")
+	numaNodePath := filepath.Join(pciDevicesBasePath, pciAddress, "numa_node")
 	// #nosec No risk for path injection. Reading static path of NUMA node info
 	numaNodeStr, err := os.ReadFile(numaNodePath)
 	if err != nil {
@@ -254,6 +254,66 @@ func canonicalizePCIAddress(raw string) (string, error) {
 	}
 
 	return fmt.Sprintf("%04x:%02x:%02x.%1x", domain, bus, slot, function), nil
+}
+
+func getDevicePCIPathHierarchy(pciAddress string) ([]string, error) {
+	if pciAddress == "" {
+		return nil, fmt.Errorf("pci address is empty")
+	}
+
+	canonical, err := canonicalizePCIAddress(pciAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	devicePath := filepath.Join(pciDevicesBasePath, canonical)
+	resolvedPath, err := filepath.EvalSymlinks(devicePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var hierarchy []string
+	for _, part := range strings.Split(resolvedPath, string(os.PathSeparator)) {
+		addr, err := canonicalizePCIAddress(part)
+		if err != nil {
+			continue
+		}
+		hierarchy = append(hierarchy, addr)
+	}
+	if len(hierarchy) == 0 {
+		return nil, fmt.Errorf("no pci addresses found in path for %s", pciAddress)
+	}
+	return hierarchy, nil
+}
+
+const defaultPCITopologyDepth = 2
+
+// GetDevicePCITopologyGroup returns a stable identifier representing the closest shared upstream
+// PCIe components for a device. The identifier is built from the first N parents discovered in the
+// sysfs hierarchy (root port + switch by default). Devices that do not expose ancestor information
+// fall back to their own BDF string.
+func GetDevicePCITopologyGroup(pciAddress string) (string, error) {
+	hierarchy, err := getDevicePCIPathHierarchy(pciAddress)
+	if err != nil {
+		return "", err
+	}
+
+	if len(hierarchy) == 1 {
+		return hierarchy[0], nil
+	}
+
+	parents := hierarchy[:len(hierarchy)-1]
+	if len(parents) == 0 {
+		return hierarchy[len(hierarchy)-1], nil
+	}
+
+	depth := defaultPCITopologyDepth
+	if len(parents) < depth {
+		depth = len(parents)
+	}
+
+	keyParts := parents[:depth]
+	return strings.Join(keyParts, "/"), nil
 }
 
 func LookupDeviceVCPUAffinity(pciAddress string, domainSpec *api.DomainSpec) ([]uint32, error) {

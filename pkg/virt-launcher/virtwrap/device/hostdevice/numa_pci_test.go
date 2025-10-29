@@ -226,13 +226,13 @@ func TestApplyNUMAHostDeviceTopologySingleGuestCellPreservesHostNUMA(t *testing.
 	ApplyNUMAHostDeviceTopology(vmi, domain)
 
 	var pxbCount int
-	var numaNodes []int
+	var guestNodes []int
 	rootPortBuses := make(map[string]struct{})
 	for _, ctrl := range domain.Spec.Devices.Controllers {
 		if ctrl.Model == "pcie-expander-bus" {
 			pxbCount++
 			if ctrl.Target != nil && ctrl.Target.Node != nil {
-				numaNodes = append(numaNodes, *ctrl.Target.Node)
+				guestNodes = append(guestNodes, *ctrl.Target.Node)
 			}
 		}
 		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil {
@@ -243,11 +243,90 @@ func TestApplyNUMAHostDeviceTopologySingleGuestCellPreservesHostNUMA(t *testing.
 	if pxbCount != 2 {
 		t.Fatalf("expected 2 PXB controllers when devices span multiple host NUMA nodes, got %d", pxbCount)
 	}
-	if !(containsInt(numaNodes, 0) && containsInt(numaNodes, 1)) {
-		t.Fatalf("expected PXB controllers for NUMA nodes 0 and 1, got %v", numaNodes)
+	for _, node := range guestNodes {
+		if node != 0 {
+			t.Fatalf("expected PXBs to target existing guest NUMA node 0, got %d", guestNodes)
+		}
 	}
 	if len(rootPortBuses) != 2 {
 		t.Fatalf("expected root ports to be attached to two PXB buses, got %d buses", len(rootPortBuses))
+	}
+}
+
+func TestApplyNUMAHostDeviceTopologyGroupsByTopologyWithinNUMA(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		domain := strings.TrimPrefix(addr.Domain, "0x")
+		bus := strings.TrimPrefix(addr.Bus, "0x")
+		return fmt.Sprintf("%s:%s:00.0", domain, bus), nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) { return 0, nil }
+
+	groupMap := map[string]string{
+		"0000:03:00.0": "switch-a",
+		"0000:04:00.0": "switch-b",
+		"0000:05:00.0": "switch-a",
+	}
+	getDevicePCIProximityGroupFunc = func(bdf string) (string, error) {
+		if group, ok := groupMap[bdf]; ok {
+			return group, nil
+		}
+		return "default", nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+					newTestPCIHostDevice("gpu2", "0x0000", "0x04"),
+					newTestPCIHostDevice("gpu3", "0x0000", "0x05"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	var pxbControllers []api.Controller
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-expander-bus" {
+			pxbControllers = append(pxbControllers, ctrl)
+		}
+	}
+	if len(pxbControllers) != 2 {
+		t.Fatalf("expected 2 topology-specific PXBs on the same NUMA node, got %d", len(pxbControllers))
+	}
+	for _, ctrl := range pxbControllers {
+		if ctrl.Target == nil || ctrl.Target.Node == nil || *ctrl.Target.Node != 0 {
+			t.Fatalf("expected PXBs to target NUMA node 0, got %+v", ctrl.Target)
+		}
+	}
+
+	rootPortCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-root-port" {
+			rootPortCount++
+		}
+	}
+	if rootPortCount != len(domain.Spec.Devices.HostDevices) {
+		t.Fatalf("expected a dedicated root port per device, got %d ports for %d devices", rootPortCount, len(domain.Spec.Devices.HostDevices))
 	}
 }
 
@@ -312,10 +391,23 @@ func TestApplyNUMAHostDeviceTopologyHandlesMdev(t *testing.T) {
 	}
 }
 
+const defaultTopologyGroup = "default-topology"
+
+func setDefaultTopologyGrouping() {
+	getDevicePCIProximityGroupFunc = func(string) (string, error) {
+		return defaultTopologyGroup, nil
+	}
+}
+
+func init() {
+	setDefaultTopologyGrouping()
+}
+
 func restoreNUMAHelpers() {
 	formatPCIAddressFunc = hardware.FormatPCIAddress
 	getDeviceNumaNodeIntFunc = hardware.GetDeviceNumaNodeInt
 	getMdevParentPCIAddressFunc = hardware.GetMdevParentPCIAddress
+	setDefaultTopologyGrouping()
 }
 
 func newTestPCIHostDevice(name, domain, bus string) api.HostDevice {

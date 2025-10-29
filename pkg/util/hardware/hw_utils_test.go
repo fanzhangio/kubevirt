@@ -190,4 +190,71 @@ var _ = Describe("Hardware utils test", func() {
 			Expect(err).To(HaveOccurred())
 		})
 	})
+
+	Context("PCI topology grouping", func() {
+		var (
+			tmpDir  string
+			oldBase string
+		)
+
+		BeforeEach(func() {
+			var err error
+			tmpDir, err = os.MkdirTemp("", "kubevirt-pci-topology-*")
+			Expect(err).ToNot(HaveOccurred())
+
+			oldBase = pciDevicesBasePath
+
+			// Build a fake hierarchy resembling:
+			// 0000:00:01.0 -> 0000:01:00.0 -> 0000:02:01.0 -> 0000:03:00.0
+			//                                     |
+			//                                     -> 0000:02:02.0 -> 0000:04:00.0
+			// 0000:00:01.0 -> 0000:01:01.0 -> 0000:05:00.0
+			root := filepath.Join(tmpDir, "sys", "devices", "pci0000:00")
+			Expect(os.MkdirAll(filepath.Join(root, "0000:00:01.0", "0000:01:00.0", "0000:02:01.0", "0000:03:00.0"), 0o755)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(root, "0000:00:01.0", "0000:01:00.0", "0000:02:02.0", "0000:04:00.0"), 0o755)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(root, "0000:00:01.0", "0000:01:01.0", "0000:05:00.0"), 0o755)).To(Succeed())
+
+			devicesBase := filepath.Join(tmpDir, "sys", "bus", "pci", "devices")
+			Expect(os.MkdirAll(devicesBase, 0o755)).To(Succeed())
+
+			Expect(os.Symlink(filepath.Join(root, "0000:00:01.0", "0000:01:00.0", "0000:02:01.0", "0000:03:00.0"),
+				filepath.Join(devicesBase, "0000:03:00.0"))).To(Succeed())
+			Expect(os.Symlink(filepath.Join(root, "0000:00:01.0", "0000:01:00.0", "0000:02:02.0", "0000:04:00.0"),
+				filepath.Join(devicesBase, "0000:04:00.0"))).To(Succeed())
+			Expect(os.Symlink(filepath.Join(root, "0000:00:01.0", "0000:01:01.0", "0000:05:00.0"),
+				filepath.Join(devicesBase, "0000:05:00.0"))).To(Succeed())
+
+			pciDevicesBasePath = devicesBase
+		})
+
+		AfterEach(func() {
+			pciDevicesBasePath = oldBase
+			Expect(os.RemoveAll(tmpDir)).To(Succeed())
+		})
+
+		It("returns the canonical hierarchy for a device", func() {
+			hierarchy, err := getDevicePCIPathHierarchy("0000:03:00.0")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(hierarchy).To(Equal([]string{
+				"0000:00:01.0",
+				"0000:01:00.0",
+				"0000:02:01.0",
+				"0000:03:00.0",
+			}))
+		})
+
+		It("groups devices by their upstream root port and first switch", func() {
+			groupA, err := GetDevicePCITopologyGroup("0000:03:00.0")
+			Expect(err).ToNot(HaveOccurred())
+			groupB, err := GetDevicePCITopologyGroup("0000:04:00.0")
+			Expect(err).ToNot(HaveOccurred())
+			groupC, err := GetDevicePCITopologyGroup("0000:05:00.0")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(groupA).To(Equal("0000:00:01.0/0000:01:00.0"))
+			Expect(groupB).To(Equal("0000:00:01.0/0000:01:00.0"))
+			Expect(groupC).To(Equal("0000:00:01.0/0000:01:01.0"))
+		})
+
+	})
 })
