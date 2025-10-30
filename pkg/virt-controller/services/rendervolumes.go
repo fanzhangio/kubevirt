@@ -67,6 +67,8 @@ func (vr *VolumeRenderer) Mounts() []k8sv1.VolumeMount {
 	if !vr.useImageVolumes {
 		volumeMounts = append(volumeMounts, mountPathWithPropagation(containerDisks, vr.containerDiskDir, k8sv1.MountPropagationHostToContainer))
 	}
+	// (Nvidia) NGN/VMaaS Customized commit. always appends the podinfo mount/volume to the base set, exposing pod metadata under /var/run/kubevirt-private/downwardapi/podinfo
+	volumeMounts = append(volumeMounts, mountPath(podInfoVolumeName, podInfoMountPath))
 	return append(volumeMounts, vr.podVolumeMounts...)
 }
 
@@ -78,6 +80,7 @@ func (vr *VolumeRenderer) Volumes() []k8sv1.Volume {
 		emptyDirVolume(virtBinDir),
 		emptyDirVolume("libvirt-runtime"),
 		emptyDirVolume("ephemeral-disks"),
+		podInfoVolume(),
 	}
 	if !vr.useImageVolumes {
 		volumes = append(volumes, emptyDirVolume(containerDisks))
@@ -113,6 +116,30 @@ func emptyDirVolume(name string) k8sv1.Volume {
 		Name: name,
 		VolumeSource: k8sv1.VolumeSource{
 			EmptyDir: &k8sv1.EmptyDirVolumeSource{}},
+	}
+}
+
+func podInfoVolume() k8sv1.Volume {
+	return k8sv1.Volume{
+		Name: podInfoVolumeName,
+		VolumeSource: k8sv1.VolumeSource{
+			DownwardAPI: &k8sv1.DownwardAPIVolumeSource{
+				Items: []k8sv1.DownwardAPIVolumeFile{
+					{
+						Path: podInfoLabelsFile,
+						FieldRef: &k8sv1.ObjectFieldSelector{
+							FieldPath: "metadata.labels",
+						},
+					},
+					{
+						Path: podInfoAnnotsFile,
+						FieldRef: &k8sv1.ObjectFieldSelector{
+							FieldPath: "metadata.annotations",
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -838,4 +865,11 @@ func (vr *VolumeRenderer) handleDownwardMetrics(volume v1.Volume) {
 		Name:      volume.Name,
 		MountPath: config.DownwardMetricDisksDir,
 	})
+}
+
+// (Nividia) NGN/VMaaS. Add additional volume mounts to the volume renderer
+func WithAdditionalVolumeMounts(mounts ...k8sv1.VolumeMount) Option {
+	return func(renderer *ContainerSpecRenderer) {
+		renderer.volumeMounts = append(renderer.volumeMounts, mounts...)
+	}
 }

@@ -418,6 +418,9 @@ func defaultVolumes() []k8sv1.Volume {
 		}, {
 			Name:         "container-disks",
 			VolumeSource: k8sv1.VolumeSource{EmptyDir: &k8sv1.EmptyDirVolumeSource{}},
+		}, {
+			Name:         podInfoVolumeName,
+			VolumeSource: podInfoVolume().VolumeSource,
 		},
 	}
 }
@@ -432,5 +435,6 @@ func defaultVolumeMounts() []k8sv1.VolumeMount {
 		{Name: "container-disks", MountPath: "cdisk1", MountPropagation: &hostToContainerPropagation},
 		{Name: "libvirt-runtime", MountPath: "/var/run/libvirt"},
 		{Name: "sockets", MountPath: "dir1/sockets"},
+		{Name: podInfoVolumeName, MountPath: podInfoMountPath},
 	}
 }
