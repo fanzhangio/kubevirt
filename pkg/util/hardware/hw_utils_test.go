@@ -233,7 +233,7 @@ var _ = Describe("Hardware utils test", func() {
 		})
 
 		It("returns the canonical hierarchy for a device", func() {
-			hierarchy, err := getDevicePCIPathHierarchy("0000:03:00.0")
+			hierarchy, err := GetDevicePCIPathHierarchy("0000:03:00.0")
 			Expect(err).ToNot(HaveOccurred())
 			Expect(hierarchy).To(Equal([]string{
 				"0000:00:01.0",
@@ -256,5 +256,59 @@ var _ = Describe("Hardware utils test", func() {
 			Expect(groupC).To(Equal("0000:00:01.0/0000:01:01.0"))
 		})
 
+	})
+
+	Context("GetDeviceIOMMUGroupInfo", func() {
+		var (
+			tmpDir string
+			oldDir string
+		)
+
+		BeforeEach(func() {
+			var err error
+			tmpDir, err = os.MkdirTemp("", "kubevirt-iommu-*")
+			Expect(err).ToNot(HaveOccurred())
+
+			root := filepath.Join(tmpDir, "sys", "devices", "pci0000:00", "0000:00:01.0", "0000:01:00.0", "0000:02:01.0", "0000:03:00.0")
+			Expect(os.MkdirAll(root, 0o755)).To(Succeed())
+			other := filepath.Join(tmpDir, "sys", "devices", "pci0000:00", "0000:00:01.0", "0000:01:00.0", "0000:02:02.0", "0000:04:00.0")
+			Expect(os.MkdirAll(other, 0o755)).To(Succeed())
+
+			devicesBase := filepath.Join(tmpDir, "sys", "bus", "pci", "devices")
+			Expect(os.MkdirAll(devicesBase, 0o755)).To(Succeed())
+
+			Expect(os.Symlink(root, filepath.Join(devicesBase, "0000:03:00.0"))).To(Succeed())
+			Expect(os.Symlink(other, filepath.Join(devicesBase, "0000:04:00.0"))).To(Succeed())
+
+			groupDir := filepath.Join(tmpDir, "sys", "kernel", "iommu_groups", "7")
+			Expect(os.MkdirAll(filepath.Join(groupDir, "devices"), 0o755)).To(Succeed())
+
+			groupLinkTarget := groupDir
+			Expect(os.Symlink(groupLinkTarget, filepath.Join(root, "iommu_group"))).To(Succeed())
+
+			Expect(os.Symlink(filepath.Join(devicesBase, "0000:03:00.0"), filepath.Join(groupDir, "devices", "0000:03:00.0"))).To(Succeed())
+
+			oldDir = pciDevicesBasePath
+			pciDevicesBasePath = devicesBase
+		})
+
+		AfterEach(func() {
+			pciDevicesBasePath = oldDir
+			Expect(os.RemoveAll(tmpDir)).To(Succeed())
+		})
+
+		It("returns group information when present", func() {
+			groupID, peers, err := GetDeviceIOMMUGroupInfo("0000:03:00.0")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(groupID).To(Equal(7))
+			Expect(peers).To(ContainElement("0000:03:00.0"))
+		})
+
+		It("handles devices without groups gracefully", func() {
+			groupID, peers, err := GetDeviceIOMMUGroupInfo("0000:04:00.0")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(groupID).To(Equal(-1))
+			Expect(peers).To(BeEmpty())
+		})
 	})
 })

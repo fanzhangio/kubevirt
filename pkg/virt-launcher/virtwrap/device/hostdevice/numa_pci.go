@@ -14,12 +14,11 @@ import (
 )
 
 const (
-	rootBusDomain           = "0x0000"
-	defaultPXBSlot          = 0x0a
-	maxRootBusSlot          = 0x1f
-	maxRootPortSlot         = 0x1f
-	unifiedNUMAGroup        = 0
-	unifiedTopologyGroupKey = "collapsed"
+	rootBusDomain    = "0x0000"
+	defaultPXBSlot   = 0x0a
+	maxRootBusSlot   = 0x1f
+	maxRootPortSlot  = 0x1f
+	unifiedNUMAGroup = 0
 )
 
 var (
@@ -27,6 +26,8 @@ var (
 	getDeviceNumaNodeIntFunc       = hardware.GetDeviceNumaNodeInt
 	getMdevParentPCIAddressFunc    = hardware.GetMdevParentPCIAddress
 	getDevicePCIProximityGroupFunc = hardware.GetDevicePCITopologyGroup
+	getDevicePCIPathHierarchyFunc  = hardware.GetDevicePCIPathHierarchy
+	getDeviceIOMMUGroupInfoFunc    = hardware.GetDeviceIOMMUGroupInfo
 )
 
 type numaPCIPlanner struct {
@@ -36,7 +37,8 @@ type numaPCIPlanner struct {
 	nextPXBSlot         int
 	usedRootSlots       map[int]struct{}
 	usedNUMAChassis     map[int]struct{}
-	pxbs                map[deviceGroupKey]*pxbInfo
+	pxbs                map[pxbKey]*pxbInfo
+	rootPorts           map[deviceGroupKey]*rootPortInfo
 }
 
 type pxbInfo struct {
@@ -50,17 +52,27 @@ type rootPortInfo struct {
 }
 
 type deviceNUMAInfo struct {
-	dev           *api.HostDevice
-	hostNUMANode  int
-	guestNUMANode int
-	bdf           string
-	topologyGroup string
+	dev             *api.HostDevice
+	hostNUMANode    int
+	guestNUMANode   int
+	bdf             string
+	topologyGroup   string
+	path            []string
+	pathKey         string
+	iommuGroup      int
+	iommuPeers      []string
+	mappingAccurate bool
 }
 
 type deviceGroupKey struct {
 	guestNUMANode int
 	hostNUMANode  int
-	topology      string
+	pathKey       string
+}
+
+type pxbKey struct {
+	guestNUMANode int
+	hostNUMANode  int
 }
 
 func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Domain) {
@@ -90,6 +102,9 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 	devicesWithNUMA := make([]deviceNUMAInfo, 0, len(hostDevices))
 	hostNUMANodes := make(map[int]struct{})
 	guestNUMANodes := getGuestNUMANodes(domain)
+	hostToGuestNUMA := getHostToGuestNUMAMap(domain)
+	unmappedHostNodes := make(map[int]struct{})
+	allMappingsAccurate := true
 
 	for i := range hostDevices {
 		dev := &domain.Spec.Devices.HostDevices[i]
@@ -111,23 +126,47 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			}
 			continue
 		}
-		groupID, err := getDevicePCIProximityGroupFunc(bdf)
+		topologyGroup, err := getDevicePCIProximityGroupFunc(bdf)
 		if err != nil {
 			log.Log.V(1).Reason(err).Infof("using default topology grouping for host device %s (host NUMA %d)", bdf, numaNode)
-			groupID = fmt.Sprintf("numa-%d", numaNode)
+			topologyGroup = fmt.Sprintf("numa-%d", numaNode)
 		}
-		guestNode, ok := mapHostToGuestNUMANode(numaNode, guestNUMANodes)
-		if !ok {
-			log.Log.V(1).Infof("host device %s (host NUMA %d) remapped to guest NUMA node %d - guest NUMA cell missing", bdf, numaNode, guestNode)
+
+		path, err := getDevicePCIPathHierarchyFunc(bdf)
+		if err != nil {
+			log.Log.V(1).Reason(err).Infof("skipping host device %s - unable to derive PCI hierarchy", bdf)
+			continue
+		}
+		pathKey := bdf
+		if len(path) > 1 {
+			pathKey = strings.Join(path[:len(path)-1], "/")
+		}
+
+		iommuGroup, iommuPeers, err := getDeviceIOMMUGroupInfoFunc(bdf)
+		if err != nil {
+			log.Log.Reason(err).Warningf("unable to detect IOMMU group for host device %s", bdf)
+		}
+
+		guestNode, mappingAccurate := mapHostToGuestNUMANode(numaNode, guestNUMANodes, hostToGuestNUMA)
+		if !mappingAccurate {
+			unmappedHostNodes[numaNode] = struct{}{}
+			allMappingsAccurate = false
+			log.Log.V(1).Infof("host device %s (host NUMA %d) cannot be matched to a distinct guest NUMA node", bdf, numaNode)
 		} else {
 			log.Log.V(1).Infof("host device %s aligned with guest NUMA node %d", bdf, guestNode)
 		}
+
 		devicesWithNUMA = append(devicesWithNUMA, deviceNUMAInfo{
-			dev:           dev,
-			hostNUMANode:  numaNode,
-			guestNUMANode: guestNode,
-			bdf:           bdf,
-			topologyGroup: groupID,
+			dev:             dev,
+			hostNUMANode:    numaNode,
+			guestNUMANode:   guestNode,
+			bdf:             bdf,
+			topologyGroup:   topologyGroup,
+			path:            path,
+			pathKey:         pathKey,
+			iommuGroup:      iommuGroup,
+			iommuPeers:      iommuPeers,
+			mappingAccurate: mappingAccurate,
 		})
 		hostNUMANodes[numaNode] = struct{}{}
 	}
@@ -137,29 +176,46 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		return
 	}
 
+	if !allMappingsAccurate {
+		var nodes []string
+		for node := range unmappedHostNodes {
+			nodes = append(nodes, strconv.Itoa(node))
+		}
+		slices.Sort(nodes)
+		log.Log.Infof("NUMA host device topology not applied: guest NUMA topology lacks representation for host NUMA nodes %s", strings.Join(nodes, ","))
+		return
+	}
+
+	if domain.Spec.CPU.NUMA != nil && len(domain.Spec.CPU.NUMA.Cells) == 1 && len(hostNUMANodes) > 1 {
+		var hostNodes []string
+		for node := range hostNUMANodes {
+			hostNodes = append(hostNodes, strconv.Itoa(node))
+		}
+		slices.Sort(hostNodes)
+		log.Log.Infof("NUMA host device topology not applied: guest exposes a single NUMA cell but devices span host NUMA nodes %s", strings.Join(hostNodes, ","))
+		return
+	}
+
 	collapseNUMA := shouldCollapseHostDeviceNUMA(vmi, domain, hostNUMANodes)
 	if collapseNUMA {
 		log.Log.V(1).Info("collapsing host device NUMA groups to a single guest NUMA node")
 	}
 
-	grouped := make(map[deviceGroupKey][]*api.HostDevice)
+	grouped := make(map[deviceGroupKey][]deviceNUMAInfo)
 	for _, info := range devicesWithNUMA {
 		groupKey := deviceGroupKey{
 			hostNUMANode:  info.hostNUMANode,
 			guestNUMANode: info.guestNUMANode,
-			topology:      info.topologyGroup,
+			pathKey:       info.pathKey,
 		}
 		if collapseNUMA {
-			log.Log.V(1).Infof("host device %s (host NUMA %d, topology %q) collapsed to guest NUMA group %d", info.bdf, info.hostNUMANode, info.topologyGroup, unifiedNUMAGroup)
-			groupKey = deviceGroupKey{
-				hostNUMANode:  unifiedNUMAGroup,
-				guestNUMANode: unifiedNUMAGroup,
-				topology:      unifiedTopologyGroupKey,
-			}
+			log.Log.V(1).Infof("host device %s (host NUMA %d, path %q) collapsed to guest NUMA group %d", info.bdf, info.hostNUMANode, info.pathKey, unifiedNUMAGroup)
+			groupKey.hostNUMANode = unifiedNUMAGroup
+			groupKey.guestNUMANode = unifiedNUMAGroup
 		} else {
-			log.Log.V(1).Infof("host device %s grouped to host NUMA %d (guest NUMA %d) topology %q", info.bdf, groupKey.hostNUMANode, groupKey.guestNUMANode, groupKey.topology)
+			log.Log.V(1).Infof("host device %s grouped to host NUMA %d (guest NUMA %d) path %q", info.bdf, groupKey.hostNUMANode, groupKey.guestNUMANode, groupKey.pathKey)
 		}
-		grouped[groupKey] = append(grouped[groupKey], info.dev)
+		grouped[groupKey] = append(grouped[groupKey], info)
 	}
 
 	groupKeys := make([]deviceGroupKey, 0, len(grouped))
@@ -179,39 +235,60 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			}
 			return 1
 		}
-		if a.topology == b.topology {
+		if a.pathKey == b.pathKey {
 			return 0
 		}
-		if a.topology < b.topology {
+		if a.pathKey < b.pathKey {
 			return -1
 		}
 		return 1
 	})
 
+	requestedDevices := make(map[string]struct{}, len(devicesWithNUMA))
+	for _, info := range devicesWithNUMA {
+		requestedDevices[info.bdf] = struct{}{}
+	}
+
 	for _, key := range groupKeys {
-		devices := grouped[key]
-		if len(devices) == 0 {
+		infos := grouped[key]
+		if len(infos) == 0 {
 			continue
 		}
-		log.Log.V(1).Infof("setting up PCI expander bus for host NUMA %d (guest NUMA %d) topology %q with %d devices",
-			key.hostNUMANode, key.guestNUMANode, key.topology, len(devices))
-		pxb, err := planner.ensurePXBForGroup(key.hostNUMANode, key.guestNUMANode, key.topology)
+
+		pathLabel := infos[0].pathKey
+		if len(infos[0].path) > 0 {
+			pathLabel = strings.Join(infos[0].path, " -> ")
+		}
+
+		log.Log.V(1).Infof("setting up PCI expander bus for host NUMA %d (guest NUMA %d) path %q with %d devices",
+			key.hostNUMANode, key.guestNUMANode, pathLabel, len(infos))
+
+		pxb, err := planner.ensurePXB(key.hostNUMANode, key.guestNUMANode)
 		if err != nil {
-			log.Log.Reason(err).Errorf("failed to create PCI expander bus for host NUMA %d (guest NUMA %d) topology %q",
-				key.hostNUMANode, key.guestNUMANode, key.topology)
+			log.Log.Reason(err).Errorf("failed to create PCI expander bus for host NUMA %d (guest NUMA %d)", key.hostNUMANode, key.guestNUMANode)
 			continue
 		}
-		for _, dev := range devices {
-			rootPort, err := planner.addRootPort(pxb)
-			if err != nil {
-				log.Log.Reason(err).Error("failed to allocate root port for host device")
-				continue
+
+		rootPort, err := planner.ensureRootPortForGroup(pxb, key)
+		if err != nil {
+			log.Log.Reason(err).Error("failed to allocate root port for host device path")
+			continue
+		}
+
+		for _, info := range infos {
+			if info.iommuGroup >= 0 {
+				for _, peer := range info.iommuPeers {
+					if peer == info.bdf {
+						continue
+					}
+					if _, present := requestedDevices[peer]; !present {
+						log.Log.Warningf("host device %s belongs to IOMMU group %d with peer %s that is not attached to the VMI", info.bdf, info.iommuGroup, peer)
+					}
+				}
 			}
-			// The planner hands out each PCIe root port controller a monotonically increasing index (starting from whatever the domain already used).
-			//  When we assign a host device to that root port we derive the downstream bus straight from that index:
-			assignHostDeviceToRootPort(dev, rootPort)
-			log.Log.V(1).Infof("assigned host device to host NUMA %d (guest NUMA %d) topology %q bus %#02x",
-				key.hostNUMANode, key.guestNUMANode, key.topology, rootPort.controllerIndex)
+
+			assignHostDeviceToRootPort(info.dev, rootPort)
+			log.Log.V(1).Infof("assigned host device %s to host NUMA %d (guest NUMA %d) bus %#02x", info.bdf, key.hostNUMANode, key.guestNUMANode, rootPort.controllerIndex)
 		}
 	}
 }
@@ -222,7 +299,8 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 		nextPXBSlot:     defaultPXBSlot,
 		usedRootSlots:   map[int]struct{}{},
 		usedNUMAChassis: map[int]struct{}{},
-		pxbs:            map[deviceGroupKey]*pxbInfo{},
+		pxbs:            map[pxbKey]*pxbInfo{},
+		rootPorts:       map[deviceGroupKey]*rootPortInfo{},
 		nextChassis:     1,
 	}
 
@@ -261,11 +339,10 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	return planner
 }
 
-func (p *numaPCIPlanner) ensurePXBForGroup(hostNUMA, guestNUMA int, topology string) (*pxbInfo, error) {
-	key := deviceGroupKey{
+func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
+	key := pxbKey{
 		hostNUMANode:  hostNUMA,
 		guestNUMANode: guestNUMA,
-		topology:      topology,
 	}
 	if existing, ok := p.pxbs[key]; ok {
 		return existing, nil
@@ -308,6 +385,18 @@ func (p *numaPCIPlanner) ensurePXBForGroup(hostNUMA, guestNUMA int, topology str
 	}
 	p.pxbs[key] = info
 	return info, nil
+}
+
+func (p *numaPCIPlanner) ensureRootPortForGroup(pxb *pxbInfo, key deviceGroupKey) (*rootPortInfo, error) {
+	if existing, ok := p.rootPorts[key]; ok {
+		return existing, nil
+	}
+	rootPort, err := p.addRootPort(pxb)
+	if err != nil {
+		return nil, err
+	}
+	p.rootPorts[key] = rootPort
+	return rootPort, nil
 }
 
 func (p *numaPCIPlanner) addRootPort(info *pxbInfo) (*rootPortInfo, error) {
@@ -452,7 +541,10 @@ func getGuestNUMANodes(domain *api.Domain) map[int]struct{} {
 	return result
 }
 
-func mapHostToGuestNUMANode(hostNode int, guestNodes map[int]struct{}) (int, bool) {
+func mapHostToGuestNUMANode(hostNode int, guestNodes map[int]struct{}, hostToGuest map[int]int) (int, bool) {
+	if mapped, ok := hostToGuest[hostNode]; ok {
+		return mapped, true
+	}
 	if len(guestNodes) == 0 {
 		return hostNode, false
 	}
@@ -466,4 +558,25 @@ func mapHostToGuestNUMANode(hostNode int, guestNodes map[int]struct{}) (int, boo
 	}
 	slices.Sort(guestList)
 	return guestList[0], false
+}
+
+func getHostToGuestNUMAMap(domain *api.Domain) map[int]int {
+	result := make(map[int]int)
+	if domain == nil || domain.Spec.NUMATune == nil {
+		return result
+	}
+	for _, node := range domain.Spec.NUMATune.MemNodes {
+		if strings.TrimSpace(node.NodeSet) == "" {
+			continue
+		}
+		values, err := hardware.ParseCPUSetLine(node.NodeSet, 1024)
+		if err != nil {
+			log.Log.V(1).Reason(err).Infof("unable to parse NUMA memnode nodeset %q", node.NodeSet)
+			continue
+		}
+		for _, host := range values {
+			result[host] = int(node.CellID)
+		}
+	}
+	return result
 }

@@ -21,6 +21,7 @@ package hardware
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -256,7 +257,7 @@ func canonicalizePCIAddress(raw string) (string, error) {
 	return fmt.Sprintf("%04x:%02x:%02x.%1x", domain, bus, slot, function), nil
 }
 
-func getDevicePCIPathHierarchy(pciAddress string) ([]string, error) {
+func GetDevicePCIPathHierarchy(pciAddress string) ([]string, error) {
 	if pciAddress == "" {
 		return nil, fmt.Errorf("pci address is empty")
 	}
@@ -293,7 +294,7 @@ const defaultPCITopologyDepth = 2
 // sysfs hierarchy (root port + switch by default). Devices that do not expose ancestor information
 // fall back to their own BDF string.
 func GetDevicePCITopologyGroup(pciAddress string) (string, error) {
-	hierarchy, err := getDevicePCIPathHierarchy(pciAddress)
+	hierarchy, err := GetDevicePCIPathHierarchy(pciAddress)
 	if err != nil {
 		return "", err
 	}
@@ -314,6 +315,48 @@ func GetDevicePCITopologyGroup(pciAddress string) (string, error) {
 
 	keyParts := parents[:depth]
 	return strings.Join(keyParts, "/"), nil
+}
+
+// GetDeviceIOMMUGroupInfo returns the IOMMU group identifier for a PCI device together with all
+// peers that share the same group. A negative group identifier indicates that the device does not
+// participate in an IOMMU group on the current host.
+func GetDeviceIOMMUGroupInfo(pciAddress string) (int, []string, error) {
+	canonical, err := canonicalizePCIAddress(pciAddress)
+	if err != nil {
+		return -1, nil, err
+	}
+
+	groupLink := filepath.Join(pciDevicesBasePath, canonical, "iommu_group")
+	resolvedGroupPath, err := filepath.EvalSymlinks(groupLink)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return -1, nil, nil
+		}
+		return -1, nil, err
+	}
+
+	groupIDStr := filepath.Base(resolvedGroupPath)
+	groupID, err := strconv.Atoi(groupIDStr)
+	if err != nil {
+		return -1, nil, fmt.Errorf("failed to parse IOMMU group %q: %w", groupIDStr, err)
+	}
+
+	devicesDir := filepath.Join(resolvedGroupPath, "devices")
+	entries, err := os.ReadDir(devicesDir)
+	if err != nil {
+		return -1, nil, err
+	}
+
+	var peers []string
+	for _, entry := range entries {
+		addr, err := canonicalizePCIAddress(entry.Name())
+		if err != nil {
+			continue
+		}
+		peers = append(peers, addr)
+	}
+
+	return groupID, peers, nil
 }
 
 func LookupDeviceVCPUAffinity(pciAddress string, domainSpec *api.DomainSpec) ([]uint32, error) {
