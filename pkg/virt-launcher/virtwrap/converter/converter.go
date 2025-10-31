@@ -1943,6 +1943,7 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 
 	domain.Spec.Devices.HostDevices = append(domain.Spec.Devices.HostDevices, c.GenericHostDevices...)
 	domain.Spec.Devices.HostDevices = append(domain.Spec.Devices.HostDevices, c.GPUHostDevices...)
+	domain.Spec.Devices.HostDevices = append(domain.Spec.Devices.HostDevices, c.SRIOVDevices...)
 
 	// Apply host device NUMA topology based on VMI cpu NUMA passthrough flag
 	hostdevice.ApplyNUMAHostDeviceTopology(vmi, domain)
@@ -2023,8 +2024,6 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 		return err
 	}
 	domain.Spec.Devices.Interfaces = append(domain.Spec.Devices.Interfaces, domainInterfaces...)
-	domain.Spec.Devices.HostDevices = append(domain.Spec.Devices.HostDevices, c.SRIOVDevices...)
-
 	// Add Ignition Command Line if present
 	ignitiondata := vmi.Annotations[v1.IgnitionAnnotation]
 	if ignitiondata != "" && strings.Contains(ignitiondata, "ignition") {
