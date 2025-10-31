@@ -667,6 +667,7 @@ type ControllerModel struct {
 type ControllerTarget struct {
 	Chassis string `xml:"chassis,attr,omitempty"`
 	Port    string `xml:"port,attr,omitempty"`
+	BusNr   string `xml:"busNr,attr,omitempty"`
 	Node    *int   `xml:"node,omitempty"`
 }
 

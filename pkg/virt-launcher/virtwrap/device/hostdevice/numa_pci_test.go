@@ -1263,6 +1263,7 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 
 	port := &rootPortInfo{
 		controllerIndex: 5,
+		downstreamBus:   0x62,
 	}
 
 	assignHostDeviceToRootPort(dev, port)
@@ -1277,8 +1278,8 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 	if dev.Address.Domain != "0x0000" {
 		t.Fatalf("expected domain to be 0x0000, got %s", dev.Address.Domain)
 	}
-	if dev.Address.Bus != "0x05" {
-		t.Fatalf("expected bus to be 0x05, got %s", dev.Address.Bus)
+	if dev.Address.Bus != "0x62" {
+		t.Fatalf("expected bus to be 0x62, got %s", dev.Address.Bus)
 	}
 	if dev.Address.Controller != "5" {
 		t.Fatalf("expected controller to be 5, got %s", dev.Address.Controller)
@@ -1308,13 +1309,14 @@ func TestHostDeviceAddressFormat(t *testing.T) {
 
 	port := &rootPortInfo{
 		controllerIndex: 10,
+		downstreamBus:   0x9a,
 	}
 
 	assignHostDeviceToRootPort(dev, port)
 
 	// Should use correct hex formatting for bus, slot/function empty for PCI placement
-	if dev.Address.Bus != "0x0a" {
-		t.Fatalf("expected bus to be formatted as 0x0a, got %s", dev.Address.Bus)
+	if dev.Address.Bus != "0x9a" {
+		t.Fatalf("expected bus to be formatted as 0x9a, got %s", dev.Address.Bus)
 	}
 	if dev.Address.Controller != "10" {
 		t.Fatalf("expected controller to be 10, got %s", dev.Address.Controller)
