@@ -667,6 +667,7 @@ type ControllerModel struct {
 type ControllerTarget struct {
 	Chassis string `xml:"chassis,attr,omitempty"`
 	Port    string `xml:"port,attr,omitempty"`
+	BusNr   string `xml:"busNr,attr,omitempty"`
 	Node    *int   `xml:"node,omitempty"`
 }
 
@@ -1185,7 +1186,7 @@ type GraphicsListen struct {
 type Address struct {
 	Type       string `xml:"type,attr"`
 	Domain     string `xml:"domain,attr,omitempty"`
-	Bus        string `xml:"bus,attr"`
+	Bus        string `xml:"bus,attr,omitempty"`
 	Slot       string `xml:"slot,attr,omitempty"`
 	Function   string `xml:"function,attr,omitempty"`
 	Controller string `xml:"controller,attr,omitempty"`

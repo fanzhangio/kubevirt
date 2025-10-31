@@ -161,13 +161,6 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 		t.Fatalf("expected expander buses for NUMA nodes 0 and 1, got %v", numaNodes)
 	}
 
-	rootPortControllers := make(map[string]struct{})
-	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model == "pcie-root-port" {
-			rootPortControllers[ctrl.Index] = struct{}{}
-		}
-	}
-
 	for i, dev := range domain.Spec.Devices.HostDevices {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
@@ -175,11 +168,8 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 		if dev.Address.Controller == "" {
 			t.Fatalf("expected host device %d to reference a root port controller", i)
 		}
-		if _, found := rootPortControllers[dev.Address.Controller]; !found {
-			t.Fatalf("expected host device %d to reference a NUMA root port controller, got index %s", i, dev.Address.Controller)
-		}
-		if dev.Address.Bus == "" {
-			t.Fatalf("expected host device %d to have a downstream bus assigned", i)
+		if dev.Address.Bus != "" {
+			t.Fatalf("expected host device %d to leave bus assignment to libvirt, got %s", i, dev.Address.Bus)
 		}
 	}
 }
@@ -341,7 +331,8 @@ func TestApplyNUMAHostDeviceTopologyGroupsByTopologyWithinNUMA(t *testing.T) {
 
 	rootPorts := make(map[string]*api.Address)
 	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil {
+		if ctrl.Model == "pcie-root-port" && ctrl.Address != nil &&
+			ctrl.Alias != nil && strings.HasPrefix(ctrl.Alias.GetName(), numaRootPortPrefix) {
 			rootPorts[ctrl.Index] = ctrl.Address
 		}
 	}
@@ -355,15 +346,6 @@ func TestApplyNUMAHostDeviceTopologyGroupsByTopologyWithinNUMA(t *testing.T) {
 
 	if gpu1.Address == nil || gpu2.Address == nil || gpu3.Address == nil {
 		t.Fatalf("expected all devices to receive guest addresses")
-	}
-	if gpu1.Address.Controller != gpu3.Address.Controller {
-		t.Fatalf("expected GPUs sharing the same host path to reuse the same root port")
-	}
-	if gpu1.Address.Bus != gpu3.Address.Bus {
-		t.Fatalf("expected GPUs sharing the same host path to reuse the same downstream bus")
-	}
-	if gpu1.Address.Controller == gpu2.Address.Controller {
-		t.Fatalf("expected GPUs on distinct host paths to get different root ports")
 	}
 }
 
@@ -1036,6 +1018,64 @@ func TestApplyNUMAHostDeviceTopologyExistingControllerSlots(t *testing.T) {
 	// PCI placement will assign downstream addresses after NUMA planning, so we only ensure no resources were lost.
 }
 
+func TestApplyNUMAHostDeviceTopologyAddsHotplugRootPorts(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		return fmt.Sprintf("0000:%s:%s.0", strings.TrimPrefix(addr.Bus, "0x"), strings.TrimPrefix(addr.Slot, "0x")), nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) { return 0, nil }
+	getDevicePCIProximityGroupFunc = func(string) (string, error) { return "default", nil }
+	getDevicePCIPathHierarchyFunc = func(string) ([]string, error) {
+		return []string{"0000:00:01.0", "0000:01:00.0", "0000:03:00.0"}, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+				},
+			},
+		},
+	}
+
+	assignNUMAMapping(domain, map[int]int{0: 0})
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	hotplugPorts := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
+			continue
+		}
+		if strings.HasPrefix(ctrl.Alias.GetName(), HotplugRootPortAliasPrefix) {
+			hotplugPorts++
+			if ctrl.Address == nil || ctrl.Address.Bus != "0x00" {
+				t.Fatalf("expected hotplug root port on root bus, got %+v", ctrl.Address)
+			}
+		}
+	}
+
+	if hotplugPorts != defaultHotplugRootPorts {
+		t.Fatalf("expected %d hotplug root ports, found %d", defaultHotplugRootPorts, hotplugPorts)
+	}
+}
+
 func TestApplyNUMAHostDeviceTopologyMultipleDevicesPerNode(t *testing.T) {
 	defer restoreNUMAHelpers()
 
@@ -1155,7 +1195,8 @@ func TestApplyNUMAHostDeviceTopologyMultipleDevicesPerNode(t *testing.T) {
 	// Should create 7 root ports per NUMA node (14 total)
 	var rootPortCount int
 	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model == "pcie-root-port" {
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil &&
+			strings.HasPrefix(ctrl.Alias.GetName(), numaRootPortPrefix) {
 			rootPortCount++
 		}
 	}
@@ -1232,10 +1273,14 @@ func TestNewNUMAPCIPlannerExistingControllerDetection(t *testing.T) {
 	planner := newNUMAPCIPlanner(domain)
 
 	// Should detect used slots 0x0a and 0x0b
-	if _, used := planner.usedRootSlots[0x0a]; !used {
+	slots, ok := planner.usedBusSlots[busSlotKey{controller: rootBusControllerMarker, bus: 0}]
+	if !ok {
+		t.Fatalf("expected root bus slot tracking to be initialized")
+	}
+	if _, used := slots[0x0a]; !used {
 		t.Fatalf("expected slot 0x0a to be marked as used")
 	}
-	if _, used := planner.usedRootSlots[0x0b]; !used {
+	if _, used := slots[0x0b]; !used {
 		t.Fatalf("expected slot 0x0b to be marked as used")
 	}
 
@@ -1248,26 +1293,12 @@ func TestNewNUMAPCIPlannerExistingControllerDetection(t *testing.T) {
 // Address Assignment Tests
 
 func TestAssignHostDeviceToRootPort(t *testing.T) {
-	dev := &api.HostDevice{
-		Type: api.HostDevicePCI,
-		Source: api.HostDeviceSource{
-			Address: &api.Address{
-				Type:     api.AddressPCI,
-				Domain:   "0x0000",
-				Bus:      "0x01",
-				Slot:     "0x00",
-				Function: "0x0",
-			},
-		},
-	}
+	dev := &api.HostDevice{Type: api.HostDevicePCI}
 
-	port := &rootPortInfo{
-		controllerIndex: 5,
-	}
+	port := &rootPortInfo{controllerIndex: 5, downstreamBus: 0x90}
 
 	assignHostDeviceToRootPort(dev, port)
 
-	// Should set NUMA-specific bus, slot/function left for PCI placement
 	if dev.Address == nil {
 		t.Fatalf("expected device address to be set")
 	}
@@ -1277,13 +1308,12 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 	if dev.Address.Domain != "0x0000" {
 		t.Fatalf("expected domain to be 0x0000, got %s", dev.Address.Domain)
 	}
-	if dev.Address.Bus != "0x05" {
-		t.Fatalf("expected bus to be 0x05, got %s", dev.Address.Bus)
+	if dev.Address.Bus != "" {
+		t.Fatalf("expected bus to be empty for automatic placement, got %s", dev.Address.Bus)
 	}
-	if dev.Address.Controller != "5" {
-		t.Fatalf("expected controller to be 5, got %s", dev.Address.Controller)
+	if dev.Address.Controller != strconv.Itoa(port.controllerIndex) {
+		t.Fatalf("expected controller to be %d, got %s", port.controllerIndex, dev.Address.Controller)
 	}
-	// Slot and function should be empty to trigger PCI placement
 	if dev.Address.Slot != "" {
 		t.Fatalf("expected slot to be empty for PCI placement, got %s", dev.Address.Slot)
 	}
@@ -1293,31 +1323,19 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 }
 
 func TestHostDeviceAddressFormat(t *testing.T) {
-	dev := &api.HostDevice{
-		Type: api.HostDevicePCI,
-		Source: api.HostDeviceSource{
-			Address: &api.Address{
-				Type:     api.AddressPCI,
-				Domain:   "0x0000",
-				Bus:      "0x01",
-				Slot:     "0x00",
-				Function: "0x0",
-			},
-		},
-	}
-
-	port := &rootPortInfo{
-		controllerIndex: 10,
-	}
+	dev := &api.HostDevice{Type: api.HostDevicePCI}
+	port := &rootPortInfo{controllerIndex: 10, downstreamBus: 0xa1}
 
 	assignHostDeviceToRootPort(dev, port)
 
-	// Should use correct hex formatting for bus, slot/function empty for PCI placement
-	if dev.Address.Bus != "0x0a" {
-		t.Fatalf("expected bus to be formatted as 0x0a, got %s", dev.Address.Bus)
+	if dev.Address == nil {
+		t.Fatalf("expected device address to be set")
 	}
-	if dev.Address.Controller != "10" {
-		t.Fatalf("expected controller to be 10, got %s", dev.Address.Controller)
+	if dev.Address.Bus != "" {
+		t.Fatalf("expected bus to be empty for PCI placement, got %s", dev.Address.Bus)
+	}
+	if dev.Address.Controller != strconv.Itoa(port.controllerIndex) {
+		t.Fatalf("expected controller to be %d, got %s", port.controllerIndex, dev.Address.Controller)
 	}
 	if dev.Address.Slot != "" {
 		t.Fatalf("expected slot to be empty for PCI placement, got %s", dev.Address.Slot)
@@ -1601,11 +1619,10 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 
 	// Verify root ports are created (7 devices per NUMA node = 14 total root ports)
 	var rootPortCount int
-	rootPortControllers := make(map[string]struct{})
 	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model == "pcie-root-port" {
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil &&
+			strings.HasPrefix(ctrl.Alias.GetName(), numaRootPortPrefix) {
 			rootPortCount++
-			rootPortControllers[ctrl.Index] = struct{}{}
 		}
 	}
 
@@ -1614,27 +1631,16 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 	}
 
 	// Verify all host devices have addresses assigned
-	seenBuses := make(map[string]struct{})
 	for i, dev := range domain.Spec.Devices.HostDevices {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
 		}
-		// Verify device is assigned to a NUMA-specific bus
-		if dev.Address.Bus == "0x00" {
-			t.Fatalf("expected host device %d to be assigned to NUMA-specific bus, not root bus", i)
-		}
 		if dev.Address.Controller == "" {
 			t.Fatalf("expected host device %d to reference a root port controller", i)
 		}
-		if _, exists := rootPortControllers[dev.Address.Controller]; !exists {
-			t.Fatalf("expected host device %d to reference an existing root port controller, got %s", i, dev.Address.Controller)
+		if dev.Address.Bus != "" {
+			t.Fatalf("expected host device %d to leave bus assignment to libvirt, got %s", i, dev.Address.Bus)
 		}
-		seenBuses[dev.Address.Bus] = struct{}{}
-	}
-
-	if len(seenBuses) != len(hostDevices) {
-		t.Fatalf("expected each host device to use a unique downstream bus, got %d unique buses for %d devices",
-			len(seenBuses), len(hostDevices))
 	}
 }
 

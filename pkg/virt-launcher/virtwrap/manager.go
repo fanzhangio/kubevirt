@@ -2836,5 +2836,27 @@ func calculateHotplugPortCount(vmi *v1.VirtualMachineInstance, domainSpec *api.D
 		return 0, err
 	}
 
-	return max(defaultTotalPorts-portsInUse, minFreePorts), nil
+	requested := max(defaultTotalPorts-portsInUse, minFreePorts)
+	existing := countHotplugRootPorts(domainSpec)
+	missing := requested - existing
+	if missing < 0 {
+		missing = 0
+	}
+	return missing, nil
+}
+
+func countHotplugRootPorts(domainSpec *api.DomainSpec) int {
+	if domainSpec == nil {
+		return 0
+	}
+	count := 0
+	for _, ctrl := range domainSpec.Devices.Controllers {
+		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
+			continue
+		}
+		if strings.HasPrefix(ctrl.Alias.GetName(), hostdevice.HotplugRootPortAliasPrefix) {
+			count++
+		}
+	}
+	return count
 }
