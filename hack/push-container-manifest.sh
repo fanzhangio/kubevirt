@@ -29,17 +29,30 @@ fail_if_cri_bin_missing
 
 function podman_push_manifest() {
     image=$1
-    # FIXME: Workaround https://github.com/containers/podman/issues/18360 and remove once https://github.com/containers/podman/commit/bab4217cd16be609ac35ccf3061d1e34f787856f is released
-    echo ${KUBEVIRT_CRI} manifest create ${DOCKER_PREFIX}/${image}:${DOCKER_TAG}
-    ${KUBEVIRT_CRI} manifest create ${DOCKER_PREFIX}/${image}:${DOCKER_TAG}
+    found_images=0
+    found_image_tags=()
+    # First, check if any architecture-specific images exist
     for ARCH in ${BUILD_ARCH//,/ }; do
         FORMATTED_ARCH=$(format_archname ${ARCH} tag)
         TAGGED_IMAGE="${DOCKER_PREFIX}/${image}:${DOCKER_TAG}-${FORMATTED_ARCH}"
-        if skopeo inspect docker://${TAGGED_IMAGE} &>/dev/null; then
-            ${KUBEVIRT_CRI} manifest add ${DOCKER_PREFIX}/${image}:${DOCKER_TAG} ${TAGGED_IMAGE}
+        # Try multiple methods to verify image exists
+        if skopeo inspect docker://${TAGGED_IMAGE} &>/dev/null ||
+            ${KUBEVIRT_CRI} manifest inspect ${TAGGED_IMAGE} &>/dev/null 2>&1; then
+            found_images=$((found_images + 1))
+            found_image_tags+=("${TAGGED_IMAGE}")
         else
-            echo "Warning: Image ${TAGGED_IMAGE} does not exist, skipping"
+            echo "Warning: Image ${TAGGED_IMAGE} does not exist or is not accessible"
         fi
+    done
+    if [ "$found_images" -eq 0 ]; then
+        echo "Warning: No architecture-specific images found for ${image}, skipping manifest creation"
+        return 0
+    fi
+    # FIXME: Workaround https://github.com/containers/podman/issues/18360 and remove once https://github.com/containers/podman/commit/bab4217cd16be609ac35ccf3061d1e34f787856f is released
+    echo ${KUBEVIRT_CRI} manifest create ${DOCKER_PREFIX}/${image}:${DOCKER_TAG}
+    ${KUBEVIRT_CRI} manifest create ${DOCKER_PREFIX}/${image}:${DOCKER_TAG}
+    for TAGGED_IMAGE in "${found_image_tags[@]}"; do
+        ${KUBEVIRT_CRI} manifest add ${DOCKER_PREFIX}/${image}:${DOCKER_TAG} ${TAGGED_IMAGE}
     done
     ${KUBEVIRT_CRI} manifest push --all ${DOCKER_PREFIX}/${image}:${DOCKER_TAG} ${DOCKER_PREFIX}/${image}:${DOCKER_TAG}
 }
@@ -47,15 +60,23 @@ function podman_push_manifest() {
 function docker_push_manifest() {
     image=$1
     MANIFEST_IMAGES=""
+    found_images=0
     for ARCH in ${BUILD_ARCH//,/ }; do
         FORMATTED_ARCH=$(format_archname ${ARCH} tag)
         TAGGED_IMAGE="${DOCKER_PREFIX}/${image}:${DOCKER_TAG}-${FORMATTED_ARCH}"
-        if skopeo inspect docker://${TAGGED_IMAGE} &>/dev/null; then
+        # Try multiple methods to verify image exists
+        if skopeo inspect docker://${TAGGED_IMAGE} &>/dev/null ||
+            docker manifest inspect ${TAGGED_IMAGE} &>/dev/null 2>&1; then
             MANIFEST_IMAGES="${MANIFEST_IMAGES} --amend ${TAGGED_IMAGE}"
+            found_images=$((found_images + 1))
         else
-            echo "Warning: Image ${TAGGED_IMAGE} does not exist, skipping"
+            echo "Warning: Image ${TAGGED_IMAGE} does not exist or is not accessible"
         fi
     done
+    if [ "$found_images" -eq 0 ]; then
+        echo "Warning: No architecture-specific images found for ${image}, skipping manifest creation"
+        return 0
+    fi
     echo ${KUBEVIRT_CRI} manifest create ${DOCKER_PREFIX}/${image}:${DOCKER_TAG} ${MANIFEST_IMAGES}
     ${KUBEVIRT_CRI} manifest create ${DOCKER_PREFIX}/${image}:${DOCKER_TAG} ${MANIFEST_IMAGES}
     ${KUBEVIRT_CRI} manifest push ${DOCKER_PREFIX}/${image}:${DOCKER_TAG}
