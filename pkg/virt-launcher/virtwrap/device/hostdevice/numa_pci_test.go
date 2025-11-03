@@ -43,6 +43,7 @@ func TestIsHotplugRootPortAlias(t *testing.T) {
 		{alias: "hotplug-rp-numa-0", expected: true},
 		{alias: "ua-hotplug-rp-numa-1", expected: true},
 		{alias: "ua-ua-hotplug-rp-numa-2", expected: true},
+		{alias: fmt.Sprintf("%s0", NUMAHotplugRootPortAliasPrefix), expected: true},
 		{alias: "something-else", expected: false},
 		{alias: "ua-something-else", expected: false},
 	}
@@ -979,6 +980,185 @@ func TestApplyNUMAHostDeviceTopologySlotExhaustion(t *testing.T) {
 	}
 }
 
+func TestApplyNUMAHostDeviceTopologyReservesImplicitRootBusSlots(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		return "0000:01:00.0", nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) {
+		return 0, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+					{
+						Type:  "pci",
+						Index: "1",
+						Model: "pcie-expander-bus",
+						Address: &api.Address{
+							Type:     api.AddressPCI,
+							Domain:   "0x0000",
+							Slot:     "0x0a",
+							Function: "0x0",
+						},
+					},
+				},
+				HostDevices: []api.HostDevice{
+					{
+						Type: api.HostDevicePCI,
+						Source: api.HostDeviceSource{
+							Address: &api.Address{
+								Type:     api.AddressPCI,
+								Domain:   "0x0000",
+								Bus:      "0x01",
+								Slot:     "0x00",
+								Function: "0x0",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assignNUMAMapping(domain, map[int]int{0: 0})
+	stubPCIPath("0000:01:00.0", []string{"0000:00:01.0", "0000:01:00.0"})
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	var reservedSlot string
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model != "pcie-expander-bus" || ctrl.Alias == nil {
+			continue
+		}
+		if !strings.HasPrefix(ctrl.Alias.GetName(), numaPXBAliasPrefix) {
+			continue
+		}
+		if ctrl.Address == nil {
+			t.Fatalf("expected NUMA PXB controller to have an address")
+		}
+		reservedSlot = ctrl.Address.Slot
+	}
+
+	if reservedSlot == "" {
+		t.Fatalf("expected NUMA PXB controller to be created")
+	}
+
+	if reservedSlot == "0x0a" {
+		t.Fatalf("expected NUMA PXB controller to use a different slot than existing root bus devices")
+	}
+}
+
+func TestApplyNUMAHostDeviceTopologyHandlesExistingHotplugSlots(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		return "0000:01:00.0", nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) {
+		return 0, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	controllers := []api.Controller{
+		{Type: "pci", Index: "0", Model: "pcie-root"},
+	}
+	for i := 0; i < 3; i++ {
+		controllers = append(controllers, api.Controller{
+			Type:  "pci",
+			Index: fmt.Sprintf("%d", i+1),
+			Model: "pcie-root-port",
+			Alias: api.NewUserDefinedAlias(fmt.Sprintf("%s%d", HotplugRootPortAliasPrefix, i)),
+			Address: &api.Address{
+				Type:     api.AddressPCI,
+				Domain:   "0x0000",
+				Bus:      "0x00",
+				Slot:     fmt.Sprintf("0x%02x", rootHotplugSlotStart+i),
+				Function: "0x0",
+			},
+		})
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: controllers,
+				HostDevices: []api.HostDevice{
+					{
+						Type: api.HostDevicePCI,
+						Source: api.HostDeviceSource{
+							Address: &api.Address{
+								Type:     api.AddressPCI,
+								Domain:   "0x0000",
+								Bus:      "0x01",
+								Slot:     "0x00",
+								Function: "0x0",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	assignNUMAMapping(domain, map[int]int{0: 0})
+	stubPCIPath("0000:01:00.0", []string{"0000:00:01.0", "0000:01:00.0"})
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	foundPXB := false
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model != "pcie-expander-bus" || ctrl.Alias == nil {
+			continue
+		}
+		if !strings.HasPrefix(ctrl.Alias.GetName(), numaPXBAliasPrefix) {
+			continue
+		}
+		if ctrl.Address == nil {
+			t.Fatalf("expected NUMA PXB controller to have an address")
+		}
+		slot, err := parsePCISlot(ctrl.Address.Slot)
+		if err != nil {
+			t.Fatalf("failed to parse slot %s: %v", ctrl.Address.Slot, err)
+		}
+		if slot >= rootHotplugSlotStart {
+			t.Fatalf("expected NUMA PXB controller slot to remain below hotplug range, got %s", ctrl.Address.Slot)
+		}
+		foundPXB = true
+	}
+
+	if !foundPXB {
+		t.Fatalf("expected NUMA planner to allocate a PXB controller")
+	}
+}
+
 func TestApplyNUMAHostDeviceTopologyExistingControllerSlots(t *testing.T) {
 	defer restoreNUMAHelpers()
 
@@ -1056,112 +1236,6 @@ func TestApplyNUMAHostDeviceTopologyExistingControllerSlots(t *testing.T) {
 	// Presence of 0x0b indicates planner allocated a fresh PXB; when collapsing to a single NUMA node we accept either behaviour.
 
 	// PCI placement will assign downstream addresses after NUMA planning, so we only ensure no resources were lost.
-}
-
-func TestApplyNUMAHostDeviceTopologyAddsPlannerHotplugPorts(t *testing.T) {
-	defer restoreNUMAHelpers()
-
-	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
-		return fmt.Sprintf("0000:%s:%s.0", strings.TrimPrefix(addr.Bus, "0x"), strings.TrimPrefix(addr.Slot, "0x")), nil
-	}
-	getDeviceNumaNodeIntFunc = func(string) (int, error) { return 0, nil }
-	getDevicePCIProximityGroupFunc = func(string) (string, error) { return "default", nil }
-	getDevicePCIPathHierarchyFunc = func(string) ([]string, error) {
-		return []string{"0000:00:01.0", "0000:01:00.0", "0000:03:00.0"}, nil
-	}
-
-	vmi := &v1.VirtualMachineInstance{
-		Spec: v1.VirtualMachineInstanceSpec{
-			Domain: v1.DomainSpec{
-				CPU: &v1.CPU{
-					NUMA: &v1.NUMA{
-						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
-					},
-				},
-			},
-		},
-	}
-
-	domain := &api.Domain{
-		Spec: api.DomainSpec{
-			Devices: api.Devices{
-				Controllers: []api.Controller{
-					{Type: "pci", Index: "0", Model: "pcie-root"},
-				},
-				HostDevices: []api.HostDevice{
-					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
-				},
-			},
-		},
-	}
-
-	assignNUMAMapping(domain, map[int]int{0: 0})
-	ApplyNUMAHostDeviceTopology(vmi, domain)
-
-	hotplugPorts := 0
-	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
-			continue
-		}
-		if strings.HasPrefix(ctrl.Alias.GetName(), NUMAHotplugRootPortAliasPrefix) {
-			hotplugPorts++
-			if ctrl.Address == nil || ctrl.Address.Bus != "0x00" {
-				t.Fatalf("expected NUMA hotplug root port on root bus, got %+v", ctrl.Address)
-			}
-		}
-	}
-
-	if hotplugPorts != defaultHotplugRootPorts {
-		t.Fatalf("expected %d NUMA hotplug root ports, found %d", defaultHotplugRootPorts, hotplugPorts)
-	}
-}
-
-func TestEnsureRootHotplugCapacityRecognizesUserAliasPrefix(t *testing.T) {
-	t.Parallel()
-
-	domain := &api.Domain{
-		Spec: api.DomainSpec{
-			Devices: api.Devices{
-				Controllers: []api.Controller{},
-			},
-		},
-	}
-
-	for i := 0; i < defaultHotplugRootPorts; i++ {
-		alias := api.NewUserDefinedAlias(fmt.Sprintf("%s%s%d", api.UserAliasPrefix, NUMAHotplugRootPortAliasPrefix, i))
-		domain.Spec.Devices.Controllers = append(domain.Spec.Devices.Controllers, api.Controller{
-			Type:  "pci",
-			Index: strconv.Itoa(i + 1),
-			Model: "pcie-root-port",
-			Alias: alias,
-			Address: &api.Address{
-				Type:     api.AddressPCI,
-				Domain:   "0x0000",
-				Bus:      "0x00",
-				Slot:     fmt.Sprintf("0x%02x", rootHotplugSlotStart+i),
-				Function: "0x0",
-			},
-		})
-	}
-
-	planner := newNUMAPCIPlanner(domain)
-	if err := planner.ensureRootHotplugCapacity(defaultHotplugRootPorts); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	count := 0
-	for _, ctrl := range domain.Spec.Devices.Controllers {
-		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
-			continue
-		}
-		if IsHotplugRootPortAlias(ctrl.Alias.GetName()) {
-			count++
-		}
-	}
-
-	if count != defaultHotplugRootPorts {
-		t.Fatalf("expected %d hotplug ports, got %d", defaultHotplugRootPorts, count)
-	}
 }
 
 func TestApplyNUMAHostDeviceTopologyMultipleDevicesPerNode(t *testing.T) {

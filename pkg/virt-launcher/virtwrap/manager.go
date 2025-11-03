@@ -2853,6 +2853,12 @@ func calculateHotplugPortCount(vmi *v1.VirtualMachineInstance, domainSpec *api.D
 		requested = 0
 	}
 
+	availableSlots := availableRootHotplugSlots(domainSpec)
+	if requested > availableSlots {
+		log.Log.Object(vmi).V(1).Infof("Limiting hotplug root ports to %d due to root bus capacity (requested %d)", availableSlots, requested)
+		requested = availableSlots
+	}
+
 	return requested, nil
 }
 
@@ -2879,6 +2885,52 @@ func countExistingHotplugRootPorts(spec *api.DomainSpec) int {
 		}
 	}
 	return count
+}
+
+func availableRootHotplugSlots(spec *api.DomainSpec) int {
+	usedSlots := map[int]struct{}{
+		rootReservedSlotDefaultBridge: {},
+		rootReservedSlotICH9Sound:     {},
+		rootReservedSlotSATA:          {},
+	}
+
+	unassignedHotplugPorts := 0
+
+	if spec != nil {
+		for i := range spec.Devices.Controllers {
+			ctrl := spec.Devices.Controllers[i]
+			if ctrl.Address == nil {
+				if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && isHotplugRootPortAlias(ctrl.Alias.GetName()) {
+					unassignedHotplugPorts++
+				}
+				continue
+			}
+			bus, err := parseHexByte(ctrl.Address.Bus)
+			if err != nil || bus != 0 {
+				continue
+			}
+			slot, err := parseHexByte(ctrl.Address.Slot)
+			if err != nil {
+				if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && isHotplugRootPortAlias(ctrl.Alias.GetName()) {
+					unassignedHotplugPorts++
+				}
+				continue
+			}
+			usedSlots[slot] = struct{}{}
+		}
+	}
+
+	available := 0
+	for slot := rootHotplugSlotStart; slot <= rootReservedSlotSATA; slot++ {
+		if isRootHotplugSlotAvailable(slot, usedSlots) {
+			available++
+		}
+	}
+
+	if available <= unassignedHotplugPorts {
+		return 0
+	}
+	return available - unassignedHotplugPorts
 }
 
 func normalizeHotplugRootPortAddresses(spec *api.DomainSpec) {

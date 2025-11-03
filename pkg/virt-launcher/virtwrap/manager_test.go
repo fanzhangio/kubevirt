@@ -3990,7 +3990,7 @@ var _ = Describe("calculateHotplugPortCount", func() {
 		Entry("with 2G memory and 8 ports in use", uint64(2*gb), 8, 3),
 		Entry("with 2G+ memory and 2 ports in use", uint64(2*gb+1), 2, 14),
 		Entry("with 2G+ memory and 8 ports in use", uint64(2*gb+1), 8, 8),
-		Entry("with 3G memory and no ports in use", uint64(3*gb), 0, 16),
+		Entry("with 3G memory and no ports in use", uint64(3*gb), 0, 14),
 		Entry("with 3G memory and 4 ports in use", uint64(3*gb), 4, 12),
 		Entry("with 3G memory and 8 ports in use", uint64(3*gb), 8, 8),
 		Entry("with 3G memory and 10 ports in use", uint64(3*gb), 10, 6),
@@ -4046,6 +4046,37 @@ var _ = Describe("calculateHotplugPortCount", func() {
 		count, err := calculateHotplugPortCount(vmi, domainSpec)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(count).To(Equal(0))
+	})
+
+	It("should cap the number of requested ports to the available root slots", func() {
+		vmi := newVMI("testns", "kubevirt")
+		domainSpec := domainWithDevices(0)
+		domainSpec.Memory.Value = 3 * gb
+
+		for slot := rootHotplugSlotStart; slot <= rootReservedSlotSATA; slot++ {
+			if slot == rootReservedSlotICH9Sound || slot == rootReservedSlotSATA {
+				continue
+			}
+			if slot == rootHotplugSlotStart || slot == rootHotplugSlotStart+1 {
+				continue
+			}
+			domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
+				Type:  "pci",
+				Model: "pcie-root-port",
+				Alias: api.NewUserDefinedAlias(fmt.Sprintf("ua-existing-%d", slot)),
+				Address: &api.Address{
+					Type:     api.AddressPCI,
+					Domain:   "0x0000",
+					Bus:      "0x00",
+					Slot:     fmt.Sprintf("0x%02x", slot),
+					Function: "0x0",
+				},
+			})
+		}
+
+		count, err := calculateHotplugPortCount(vmi, domainSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(count).To(Equal(2))
 	})
 
 })

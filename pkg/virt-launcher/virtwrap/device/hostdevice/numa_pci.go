@@ -346,9 +346,6 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		}
 	}
 
-	if err := planner.ensureRootHotplugCapacity(defaultHotplugRootPorts); err != nil {
-		log.Log.Reason(err).Warning("failed to provision root bus hotplug ports for NUMA topology")
-	}
 }
 
 func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
@@ -371,6 +368,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	maxIndex := -1
 	for i := range domain.Spec.Devices.Controllers {
 		ctrl := domain.Spec.Devices.Controllers[i]
+		planner.reserveRootSlotIfNeeded(ctrl.Address)
 		idx, err := strconv.Atoi(ctrl.Index)
 		if err == nil && idx > maxIndex {
 			maxIndex = idx
@@ -382,18 +380,10 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 				if ctrl.Address.Slot != "" {
 					if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
 						planner.markBusSlot(parentIdx, busVal, int(slotVal))
-						if parentIdx == rootBusControllerMarker && busVal == 0 && int(slotVal) >= planner.nextPXBSlot {
+						if parentIdx == rootBusControllerMarker && busVal == 0 &&
+							int(slotVal) >= planner.nextPXBSlot && int(slotVal) < rootHotplugSlotStart {
 							planner.nextPXBSlot = int(slotVal) + 1
 						}
-					}
-				}
-			} else if strings.EqualFold(strings.TrimPrefix(ctrl.Address.Domain, "0x"), "0000") &&
-				strings.EqualFold(strings.TrimPrefix(ctrl.Address.Bus, "0x"), "00") &&
-				ctrl.Address.Slot != "" {
-				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
-					planner.markBusSlot(parentIdx, 0, int(slotVal))
-					if parentIdx == rootBusControllerMarker && int(slotVal) >= planner.nextPXBSlot {
-						planner.nextPXBSlot = int(slotVal) + 1
 					}
 				}
 			}
@@ -486,6 +476,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 
 	for i := range domain.Spec.Devices.HostDevices {
 		dev := &domain.Spec.Devices.HostDevices[i]
+		planner.reserveRootSlotIfNeeded(dev.Address)
 		if dev.Address != nil && dev.Address.Bus != "" {
 			if busVal, err := parseBusNumber(dev.Address.Bus); err == nil {
 				planner.reservePCIBus(busVal)
@@ -495,13 +486,6 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 						planner.markBusSlot(parentIdx, busVal, int(slotVal))
 					}
 				}
-			} else if strings.EqualFold(strings.TrimPrefix(dev.Address.Domain, "0x"), "0000") &&
-				strings.EqualFold(strings.TrimPrefix(dev.Address.Bus, "0x"), "00") &&
-				dev.Address.Slot != "" {
-				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(dev.Address.Slot, "0x"), 16, 32); err == nil {
-					parentIdx := parseControllerIndex(dev.Address.Controller, rootBusControllerMarker)
-					planner.markBusSlot(parentIdx, 0, int(slotVal))
-				}
 			}
 		}
 	}
@@ -509,6 +493,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	// Also check other device types that might use root bus addresses
 	for i := range domain.Spec.Devices.Interfaces {
 		intf := &domain.Spec.Devices.Interfaces[i]
+		planner.reserveRootSlotIfNeeded(intf.Address)
 		if intf.Address != nil && intf.Address.Bus != "" {
 			if busVal, err := parseBusNumber(intf.Address.Bus); err == nil {
 				if intf.Address.Slot != "" {
@@ -516,13 +501,6 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 						parentIdx := parseControllerIndex(intf.Address.Controller, rootBusControllerMarker)
 						planner.markBusSlot(parentIdx, busVal, int(slotVal))
 					}
-				}
-			} else if strings.EqualFold(strings.TrimPrefix(intf.Address.Domain, "0x"), "0000") &&
-				strings.EqualFold(strings.TrimPrefix(intf.Address.Bus, "0x"), "00") &&
-				intf.Address.Slot != "" {
-				if slotVal, err := strconv.ParseInt(strings.TrimPrefix(intf.Address.Slot, "0x"), 16, 32); err == nil {
-					parentIdx := parseControllerIndex(intf.Address.Controller, rootBusControllerMarker)
-					planner.markBusSlot(parentIdx, 0, int(slotVal))
 				}
 			}
 		}
@@ -684,97 +662,6 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 		controllerIndex: index,
 		downstreamBus:   downstreamBus,
 	}, nil
-}
-
-func (p *numaPCIPlanner) ensureRootHotplugCapacity(minPorts int) error {
-	if minPorts <= 0 {
-		return nil
-	}
-
-	existing := 0
-	for i := range p.domain.Spec.Devices.Controllers {
-		ctrl := p.domain.Spec.Devices.Controllers[i]
-		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && IsHotplugRootPortAlias(ctrl.Alias.GetName()) {
-			existing++
-		}
-	}
-
-	if existing >= minPorts {
-		return nil
-	}
-
-	for idx := existing; idx < minPorts; idx++ {
-		alias := fmt.Sprintf("%s%d", NUMAHotplugRootPortAliasPrefix, idx)
-		if err := p.addRootHotplugPort(alias); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *numaPCIPlanner) addRootHotplugPort(alias string) error {
-	slot, err := p.allocateRootHotplugSlot()
-	if err != nil {
-		return err
-	}
-
-	chassis := p.allocateChassis()
-	if chassis < 0 {
-		return fmt.Errorf("no more chassis numbers available for hotplug root ports")
-	}
-
-	portHex := fmt.Sprintf("0x%x", p.nextRootHotplugPort)
-	p.nextRootHotplugPort++
-
-	downstreamBus, err := p.allocatePCIBusNumber()
-	if err != nil {
-		return err
-	}
-
-	index := p.nextControllerIndex
-	p.nextControllerIndex++
-
-	controller := api.Controller{
-		Type:  "pci",
-		Index: strconv.Itoa(index),
-		Model: "pcie-root-port",
-		Target: &api.ControllerTarget{
-			Chassis: strconv.Itoa(chassis),
-			Port:    portHex,
-			BusNr:   strconv.Itoa(downstreamBus),
-		},
-		Alias: api.NewUserDefinedAlias(alias),
-		Address: &api.Address{
-			Type:     api.AddressPCI,
-			Domain:   rootBusDomain,
-			Bus:      "0x00",
-			Slot:     fmt.Sprintf("0x%02x", slot),
-			Function: "0x0",
-		},
-	}
-
-	p.markBusSlot(rootBusControllerMarker, 0, slot)
-	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
-	log.Log.V(1).Infof("NUMA PCI Planner: Created NUMA hotplug root port index=%d, slot=0x%02x", index, slot)
-	return nil
-}
-
-func (p *numaPCIPlanner) allocateRootHotplugSlot() (int, error) {
-	start := p.nextRootHotplugSlot
-	if start < rootHotplugSlotStart {
-		start = rootHotplugSlotStart
-	}
-	for slot := start; slot <= maxRootBusSlot; slot++ {
-		if slot == 0x1b || slot == 0x1f {
-			continue
-		}
-		if p.isBusSlotUsed(rootBusControllerMarker, 0, slot) {
-			continue
-		}
-		p.nextRootHotplugSlot = slot + 1
-		return slot, nil
-	}
-	return -1, fmt.Errorf("no more slots available on root bus for hotplug root ports")
 }
 
 func (p *numaPCIPlanner) allocateRootSlot() int {
@@ -1016,4 +903,74 @@ func getHostToGuestNUMAMap(domain *api.Domain) map[int]int {
 		}
 	}
 	return result
+}
+
+func (p *numaPCIPlanner) reserveRootSlotIfNeeded(addr *api.Address) {
+	if !isRootBusAddress(addr) || addr == nil || strings.TrimSpace(addr.Slot) == "" {
+		return
+	}
+	slot, err := parsePCISlot(addr.Slot)
+	if err != nil {
+		return
+	}
+	p.markBusSlot(rootBusControllerMarker, 0, slot)
+	if slot >= defaultPXBSlot && slot < rootHotplugSlotStart && slot >= p.nextPXBSlot {
+		p.nextPXBSlot = slot + 1
+	}
+}
+
+func isRootBusAddress(addr *api.Address) bool {
+	if addr == nil {
+		return false
+	}
+	if !isZeroOrUnsetPCIField(addr.Domain) {
+		return false
+	}
+	bus := strings.TrimSpace(addr.Bus)
+	if bus == "" {
+		return true
+	}
+	busVal, err := parseBusNumber(bus)
+	if err != nil {
+		return false
+	}
+	return busVal == 0
+}
+
+func parsePCISlot(value string) (int, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return -1, fmt.Errorf("empty slot value")
+	}
+	if strings.HasPrefix(trimmed, "0x") || strings.HasPrefix(trimmed, "0X") {
+		val, err := strconv.ParseInt(trimmed[2:], 16, 32)
+		return int(val), err
+	}
+	if val, err := strconv.ParseInt(trimmed, 16, 32); err == nil {
+		return int(val), nil
+	}
+	val, err := strconv.ParseInt(trimmed, 10, 32)
+	return int(val), err
+}
+
+func isZeroOrUnsetPCIField(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "0x") || strings.HasPrefix(trimmed, "0X") {
+		trimmed = trimmed[2:]
+		if trimmed == "" {
+			return true
+		}
+		val, err := strconv.ParseInt(trimmed, 16, 64)
+		return err == nil && val == 0
+	}
+	if val, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return val == 0
+	}
+	if val, err := strconv.ParseInt(trimmed, 16, 64); err == nil {
+		return val == 0
+	}
+	return false
 }
