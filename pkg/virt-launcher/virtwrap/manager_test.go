@@ -4023,6 +4023,31 @@ var _ = Describe("calculateHotplugPortCount", func() {
 		Expect(count).To(Equal(0))
 	})
 
+	It("should treat user-prefixed NUMA hotplug aliases as provisioned ports", func() {
+		vmi := newVMI("testns", "kubevirt")
+		domainSpec := domainWithDevices(10)
+		domainSpec.Memory.Value = 3 * gb
+
+		for i := 0; i < 6; i++ {
+			domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
+				Type:  "pci",
+				Model: "pcie-root-port",
+				Alias: api.NewUserDefinedAlias(fmt.Sprintf("%s%s%d", api.UserAliasPrefix, hostdevice.NUMAHotplugRootPortAliasPrefix, i)),
+				Address: &api.Address{
+					Type:     api.AddressPCI,
+					Domain:   "0x0000",
+					Bus:      "0x00",
+					Slot:     fmt.Sprintf("0x%02x", rootHotplugSlotStart+i),
+					Function: "0x0",
+				},
+			})
+		}
+
+		count, err := calculateHotplugPortCount(vmi, domainSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(count).To(Equal(0))
+	})
+
 })
 
 func newVMI(namespace, name string) *v1.VirtualMachineInstance {

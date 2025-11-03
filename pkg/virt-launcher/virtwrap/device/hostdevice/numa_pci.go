@@ -30,7 +30,7 @@ const (
 
 	rootHotplugSlotStart           = 0x10
 	defaultHotplugRootPorts        = 6
-	HotplugRootPortAliasPrefix     = "ua-hotplug-rp-"
+	HotplugRootPortAliasPrefix     = "hotplug-rp-"
 	numaHotplugAliasDiscriminator  = "numa-"
 	NUMAHotplugRootPortAliasPrefix = HotplugRootPortAliasPrefix + numaHotplugAliasDiscriminator
 )
@@ -43,6 +43,23 @@ var (
 	getDevicePCIPathHierarchyFunc  = hardware.GetDevicePCIPathHierarchy
 	getDeviceIOMMUGroupInfoFunc    = hardware.GetDeviceIOMMUGroupInfo
 )
+
+// NormalizeHotplugRootPortAlias strips any user-alias prefixes (like "ua-") that libvirt may add.
+func NormalizeHotplugRootPortAlias(alias string) string {
+	normalized := strings.TrimPrefix(alias, api.UserAliasPrefix)
+	for strings.HasPrefix(normalized, api.UserAliasPrefix) {
+		normalized = strings.TrimPrefix(normalized, api.UserAliasPrefix)
+	}
+	return normalized
+}
+
+// IsHotplugRootPortAlias reports whether the provided alias denotes a planner-managed root port.
+func IsHotplugRootPortAlias(alias string) bool {
+	if alias == "" {
+		return false
+	}
+	return strings.HasPrefix(NormalizeHotplugRootPortAlias(alias), HotplugRootPortAliasPrefix)
+}
 
 type numaPCIPlanner struct {
 	domain              *api.Domain
@@ -440,7 +457,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 						downstreamBus:   downstreamBus,
 					}
 				}
-			} else if ctrl.Model == "pcie-root-port" && strings.HasPrefix(aliasName, HotplugRootPortAliasPrefix) {
+			} else if ctrl.Model == "pcie-root-port" && IsHotplugRootPortAlias(aliasName) {
 				if ctrl.Target != nil && ctrl.Target.BusNr != "" {
 					if busNr, err2 := parseBusNumber(ctrl.Target.BusNr); err2 == nil {
 						planner.reservePCIBus(busNr)
@@ -677,7 +694,7 @@ func (p *numaPCIPlanner) ensureRootHotplugCapacity(minPorts int) error {
 	existing := 0
 	for i := range p.domain.Spec.Devices.Controllers {
 		ctrl := p.domain.Spec.Devices.Controllers[i]
-		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && strings.HasPrefix(ctrl.Alias.GetName(), HotplugRootPortAliasPrefix) {
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && IsHotplugRootPortAlias(ctrl.Alias.GetName()) {
 			existing++
 		}
 	}

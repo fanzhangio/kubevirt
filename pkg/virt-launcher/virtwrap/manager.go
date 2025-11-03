@@ -2987,8 +2987,5 @@ func nextAvailableRootHotplugSlot(start int, used map[int]struct{}) int {
 }
 
 func isHotplugRootPortAlias(alias string) bool {
-	if alias == "" {
-		return false
-	}
-	return strings.HasPrefix(alias, hostdevice.HotplugRootPortAliasPrefix)
+	return hostdevice.IsHotplugRootPortAlias(alias)
 }

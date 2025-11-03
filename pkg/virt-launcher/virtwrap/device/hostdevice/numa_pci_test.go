@@ -13,6 +13,46 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
+func TestNormalizeHotplugRootPortAlias(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"":                            "",
+		"hotplug-rp-numa-0":           "hotplug-rp-numa-0",
+		"ua-hotplug-rp-numa-1":        "hotplug-rp-numa-1",
+		"ua-ua-hotplug-rp-numa-2":     "hotplug-rp-numa-2",
+		"ua-hotplug-rp-legacy":        "hotplug-rp-legacy",
+		"ua-ua-ua-hotplug-rp-random":  "hotplug-rp-random",
+		"unrelated-prefix-hotplug-rp": "unrelated-prefix-hotplug-rp",
+		"ua-not-hotplug":              "not-hotplug",
+		"ua-ua-not-hotplug":           "not-hotplug",
+	}
+	for input, expected := range cases {
+		if got := NormalizeHotplugRootPortAlias(input); got != expected {
+			t.Fatalf("NormalizeHotplugRootPortAlias(%q) = %q, expected %q", input, got, expected)
+		}
+	}
+}
+
+func TestIsHotplugRootPortAlias(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		alias    string
+		expected bool
+	}{
+		{alias: "", expected: false},
+		{alias: "hotplug-rp-numa-0", expected: true},
+		{alias: "ua-hotplug-rp-numa-1", expected: true},
+		{alias: "ua-ua-hotplug-rp-numa-2", expected: true},
+		{alias: "something-else", expected: false},
+		{alias: "ua-something-else", expected: false},
+	}
+	for _, tc := range cases {
+		if got := IsHotplugRootPortAlias(tc.alias); got != tc.expected {
+			t.Fatalf("IsHotplugRootPortAlias(%q) = %t, expected %t", tc.alias, got, tc.expected)
+		}
+	}
+}
+
 func TestApplyNUMAHostDeviceTopologyDisabled(t *testing.T) {
 	defer restoreNUMAHelpers()
 	getDeviceNumaNodeIntFunc = func(string) (int, error) {
@@ -1073,6 +1113,54 @@ func TestApplyNUMAHostDeviceTopologyAddsPlannerHotplugPorts(t *testing.T) {
 
 	if hotplugPorts != defaultHotplugRootPorts {
 		t.Fatalf("expected %d NUMA hotplug root ports, found %d", defaultHotplugRootPorts, hotplugPorts)
+	}
+}
+
+func TestEnsureRootHotplugCapacityRecognizesUserAliasPrefix(t *testing.T) {
+	t.Parallel()
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{},
+			},
+		},
+	}
+
+	for i := 0; i < defaultHotplugRootPorts; i++ {
+		alias := api.NewUserDefinedAlias(fmt.Sprintf("%s%s%d", api.UserAliasPrefix, NUMAHotplugRootPortAliasPrefix, i))
+		domain.Spec.Devices.Controllers = append(domain.Spec.Devices.Controllers, api.Controller{
+			Type:  "pci",
+			Index: strconv.Itoa(i + 1),
+			Model: "pcie-root-port",
+			Alias: alias,
+			Address: &api.Address{
+				Type:     api.AddressPCI,
+				Domain:   "0x0000",
+				Bus:      "0x00",
+				Slot:     fmt.Sprintf("0x%02x", rootHotplugSlotStart+i),
+				Function: "0x0",
+			},
+		})
+	}
+
+	planner := newNUMAPCIPlanner(domain)
+	if err := planner.ensureRootHotplugCapacity(defaultHotplugRootPorts); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	count := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
+			continue
+		}
+		if IsHotplugRootPortAlias(ctrl.Alias.GetName()) {
+			count++
+		}
+	}
+
+	if count != defaultHotplugRootPorts {
+		t.Fatalf("expected %d hotplug ports, got %d", defaultHotplugRootPorts, count)
 	}
 }
 
