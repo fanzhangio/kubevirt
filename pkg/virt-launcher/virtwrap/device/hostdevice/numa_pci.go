@@ -21,15 +21,18 @@ const (
 	maxRootPortSlot         = 0x1f
 	minPCIBusNumber         = 0x80 // Start PXB bus numbers higher to avoid conflicts
 	maxPCIBusNumber         = 0xfe
-	rootHotplugSlotStart    = 0x10
-	defaultHotplugRootPorts = 6
 	unifiedNUMAGroup        = 0
 	rootBusControllerMarker = -1
 
-	numaPXBAliasPrefix             = "numa-pxb"
-	numaRootPortPrefix             = "numa-rp"
-	NUMAHotplugRootPortAliasPrefix = "ua-numa-hotplug-rp"
-	rootPortAliasLength            = 12
+	numaPXBAliasPrefix  = "numa-pxb"
+	numaRootPortPrefix  = "numa-rp"
+	rootPortAliasLength = 12
+
+	rootHotplugSlotStart           = 0x10
+	defaultHotplugRootPorts        = 6
+	HotplugRootPortAliasPrefix     = "ua-hotplug-rp-"
+	numaHotplugAliasDiscriminator  = "numa-"
+	NUMAHotplugRootPortAliasPrefix = HotplugRootPortAliasPrefix + numaHotplugAliasDiscriminator
 )
 
 var (
@@ -437,7 +440,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 						downstreamBus:   downstreamBus,
 					}
 				}
-			} else if ctrl.Model == "pcie-root-port" && strings.HasPrefix(aliasName, NUMAHotplugRootPortAliasPrefix) {
+			} else if ctrl.Model == "pcie-root-port" && strings.HasPrefix(aliasName, HotplugRootPortAliasPrefix) {
 				if ctrl.Target != nil && ctrl.Target.BusNr != "" {
 					if busNr, err2 := parseBusNumber(ctrl.Target.BusNr); err2 == nil {
 						planner.reservePCIBus(busNr)
@@ -674,7 +677,7 @@ func (p *numaPCIPlanner) ensureRootHotplugCapacity(minPorts int) error {
 	existing := 0
 	for i := range p.domain.Spec.Devices.Controllers {
 		ctrl := p.domain.Spec.Devices.Controllers[i]
-		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && strings.HasPrefix(ctrl.Alias.GetName(), NUMAHotplugRootPortAliasPrefix) {
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && strings.HasPrefix(ctrl.Alias.GetName(), HotplugRootPortAliasPrefix) {
 			existing++
 		}
 	}
@@ -684,7 +687,7 @@ func (p *numaPCIPlanner) ensureRootHotplugCapacity(minPorts int) error {
 	}
 
 	for idx := existing; idx < minPorts; idx++ {
-		alias := fmt.Sprintf("%s-%d", NUMAHotplugRootPortAliasPrefix, idx)
+		alias := fmt.Sprintf("%s%d", NUMAHotplugRootPortAliasPrefix, idx)
 		if err := p.addRootHotplugPort(alias); err != nil {
 			return err
 		}

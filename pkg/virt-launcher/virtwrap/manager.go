@@ -2857,14 +2857,12 @@ func calculateHotplugPortCount(vmi *v1.VirtualMachineInstance, domainSpec *api.D
 }
 
 const (
-	rootHotplugBusHex              = "0x00"
-	rootHotplugDomainHex           = "0x0000"
-	hotplugRootPortAliasPrefix     = "ua-hotplug-rp-"
-	numaHotplugRootPortAliasPrefix = hostdevice.NUMAHotplugRootPortAliasPrefix
-	rootHotplugSlotStart           = 0x10
-	rootReservedSlotDefaultBridge  = 0x01
-	rootReservedSlotICH9Sound      = 0x1b
-	rootReservedSlotSATA           = 0x1f
+	rootHotplugBusHex             = "0x00"
+	rootHotplugDomainHex          = "0x0000"
+	rootHotplugSlotStart          = 0x10
+	rootReservedSlotDefaultBridge = 0x01
+	rootReservedSlotICH9Sound     = 0x1b
+	rootReservedSlotSATA          = 0x1f
 )
 
 func countExistingHotplugRootPorts(spec *api.DomainSpec) int {
@@ -2992,6 +2990,5 @@ func isHotplugRootPortAlias(alias string) bool {
 	if alias == "" {
 		return false
 	}
-	return strings.HasPrefix(alias, hotplugRootPortAliasPrefix) ||
-		strings.HasPrefix(alias, numaHotplugRootPortAliasPrefix)
+	return strings.HasPrefix(alias, hostdevice.HotplugRootPortAliasPrefix)
 }
