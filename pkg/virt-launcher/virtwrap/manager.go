@@ -2837,22 +2837,51 @@ func calculateHotplugPortCount(vmi *v1.VirtualMachineInstance, domainSpec *api.D
 		return 0, err
 	}
 
-	requested := defaultTotalPorts - portsInUse
+	existingHotplug := countExistingHotplugRootPorts(domainSpec)
+
+	effectivePortsInUse := portsInUse - existingHotplug
+	if effectivePortsInUse < 0 {
+		effectivePortsInUse = 0
+	}
+
+	requested := defaultTotalPorts - effectivePortsInUse
 	if requested < minFreePorts {
 		requested = minFreePorts
 	}
+	requested -= existingHotplug
+	if requested < 0 {
+		requested = 0
+	}
+
 	return requested, nil
 }
 
 const (
-	rootHotplugBusHex             = "0x00"
-	rootHotplugDomainHex          = "0x0000"
-	hotplugRootPortAliasPrefix    = "ua-hotplug-rp-"
-	rootHotplugSlotStart          = 0x10
-	rootReservedSlotDefaultBridge = 0x01
-	rootReservedSlotICH9Sound     = 0x1b
-	rootReservedSlotSATA          = 0x1f
+	rootHotplugBusHex              = "0x00"
+	rootHotplugDomainHex           = "0x0000"
+	hotplugRootPortAliasPrefix     = "ua-hotplug-rp-"
+	numaHotplugRootPortAliasPrefix = hostdevice.NUMAHotplugRootPortAliasPrefix
+	rootHotplugSlotStart           = 0x10
+	rootReservedSlotDefaultBridge  = 0x01
+	rootReservedSlotICH9Sound      = 0x1b
+	rootReservedSlotSATA           = 0x1f
 )
+
+func countExistingHotplugRootPorts(spec *api.DomainSpec) int {
+	if spec == nil {
+		return 0
+	}
+	count := 0
+	for _, ctrl := range spec.Devices.Controllers {
+		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
+			continue
+		}
+		if isHotplugRootPortAlias(ctrl.Alias.GetName()) {
+			count++
+		}
+	}
+	return count
+}
 
 func normalizeHotplugRootPortAddresses(spec *api.DomainSpec) {
 	if spec == nil {
@@ -2875,6 +2904,9 @@ func normalizeHotplugRootPortAddresses(spec *api.DomainSpec) {
 		if err != nil || bus != 0 {
 			continue
 		}
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && isHotplugRootPortAlias(ctrl.Alias.GetName()) {
+			continue
+		}
 		slot, err := parseHexByte(ctrl.Address.Slot)
 		if err != nil {
 			continue
@@ -2889,7 +2921,7 @@ func normalizeHotplugRootPortAddresses(spec *api.DomainSpec) {
 		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
 			continue
 		}
-		if !strings.HasPrefix(ctrl.Alias.GetName(), hotplugRootPortAliasPrefix) {
+		if !isHotplugRootPortAlias(ctrl.Alias.GetName()) {
 			continue
 		}
 
@@ -2954,4 +2986,12 @@ func nextAvailableRootHotplugSlot(start int, used map[int]struct{}) int {
 		}
 	}
 	return start
+}
+
+func isHotplugRootPortAlias(alias string) bool {
+	if alias == "" {
+		return false
+	}
+	return strings.HasPrefix(alias, hotplugRootPortAliasPrefix) ||
+		strings.HasPrefix(alias, numaHotplugRootPortAliasPrefix)
 }

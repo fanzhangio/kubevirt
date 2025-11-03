@@ -1018,6 +1018,64 @@ func TestApplyNUMAHostDeviceTopologyExistingControllerSlots(t *testing.T) {
 	// PCI placement will assign downstream addresses after NUMA planning, so we only ensure no resources were lost.
 }
 
+func TestApplyNUMAHostDeviceTopologyAddsPlannerHotplugPorts(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		return fmt.Sprintf("0000:%s:%s.0", strings.TrimPrefix(addr.Bus, "0x"), strings.TrimPrefix(addr.Slot, "0x")), nil
+	}
+	getDeviceNumaNodeIntFunc = func(string) (int, error) { return 0, nil }
+	getDevicePCIProximityGroupFunc = func(string) (string, error) { return "default", nil }
+	getDevicePCIPathHierarchyFunc = func(string) ([]string, error) {
+		return []string{"0000:00:01.0", "0000:01:00.0", "0000:03:00.0"}, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{
+					{Type: "pci", Index: "0", Model: "pcie-root"},
+				},
+				HostDevices: []api.HostDevice{
+					newTestPCIHostDevice("gpu1", "0x0000", "0x03"),
+				},
+			},
+		},
+	}
+
+	assignNUMAMapping(domain, map[int]int{0: 0})
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	hotplugPorts := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
+			continue
+		}
+		if strings.HasPrefix(ctrl.Alias.GetName(), NUMAHotplugRootPortAliasPrefix) {
+			hotplugPorts++
+			if ctrl.Address == nil || ctrl.Address.Bus != "0x00" {
+				t.Fatalf("expected NUMA hotplug root port on root bus, got %+v", ctrl.Address)
+			}
+		}
+	}
+
+	if hotplugPorts != defaultHotplugRootPorts {
+		t.Fatalf("expected %d NUMA hotplug root ports, found %d", defaultHotplugRootPorts, hotplugPorts)
+	}
+}
+
 func TestApplyNUMAHostDeviceTopologyMultipleDevicesPerNode(t *testing.T) {
 	defer restoreNUMAHelpers()
 

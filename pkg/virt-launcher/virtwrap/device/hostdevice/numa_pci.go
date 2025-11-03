@@ -21,12 +21,15 @@ const (
 	maxRootPortSlot         = 0x1f
 	minPCIBusNumber         = 0x80 // Start PXB bus numbers higher to avoid conflicts
 	maxPCIBusNumber         = 0xfe
+	rootHotplugSlotStart    = 0x10
+	defaultHotplugRootPorts = 6
 	unifiedNUMAGroup        = 0
 	rootBusControllerMarker = -1
 
-	numaPXBAliasPrefix  = "numa-pxb"
-	numaRootPortPrefix  = "numa-rp"
-	rootPortAliasLength = 12
+	numaPXBAliasPrefix             = "numa-pxb"
+	numaRootPortPrefix             = "numa-rp"
+	NUMAHotplugRootPortAliasPrefix = "ua-numa-hotplug-rp"
+	rootPortAliasLength            = 12
 )
 
 var (
@@ -51,6 +54,8 @@ type numaPCIPlanner struct {
 	rootPorts           map[deviceGroupKey]*rootPortInfo
 	existingPXBs        map[string]*pxbInfo
 	existingRootPorts   map[string]*rootPortInfo
+	nextRootHotplugSlot int
+	nextRootHotplugPort int
 }
 
 type pxbInfo struct {
@@ -320,21 +325,27 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			log.Log.V(1).Infof("assigned host device %s to host NUMA %d (guest NUMA %d) via controller %d", info.bdf, key.hostNUMANode, key.guestNUMANode, rootPort.controllerIndex)
 		}
 	}
+
+	if err := planner.ensureRootHotplugCapacity(defaultHotplugRootPorts); err != nil {
+		log.Log.Reason(err).Warning("failed to provision root bus hotplug ports for NUMA topology")
+	}
 }
 
 func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	planner := &numaPCIPlanner{
-		domain:            domain,
-		nextPXBSlot:       defaultPXBSlot,
-		nextPCIBus:        minPCIBusNumber,
-		usedBusSlots:      map[busSlotKey]map[int]struct{}{},
-		usedNUMAChassis:   map[int]struct{}{},
-		usedPCIBuses:      map[int]struct{}{},
-		pxbs:              map[pxbKey]*pxbInfo{},
-		rootPorts:         map[deviceGroupKey]*rootPortInfo{},
-		existingPXBs:      map[string]*pxbInfo{},
-		existingRootPorts: map[string]*rootPortInfo{},
-		nextChassis:       1,
+		domain:              domain,
+		nextPXBSlot:         defaultPXBSlot,
+		nextPCIBus:          minPCIBusNumber,
+		usedBusSlots:        map[busSlotKey]map[int]struct{}{},
+		usedNUMAChassis:     map[int]struct{}{},
+		usedPCIBuses:        map[int]struct{}{},
+		pxbs:                map[pxbKey]*pxbInfo{},
+		rootPorts:           map[deviceGroupKey]*rootPortInfo{},
+		existingPXBs:        map[string]*pxbInfo{},
+		existingRootPorts:   map[string]*rootPortInfo{},
+		nextChassis:         1,
+		nextRootHotplugSlot: rootHotplugSlotStart,
+		nextRootHotplugPort: 0,
 	}
 
 	maxIndex := -1
@@ -424,6 +435,29 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 					planner.existingRootPorts[aliasName] = &rootPortInfo{
 						controllerIndex: idx,
 						downstreamBus:   downstreamBus,
+					}
+				}
+			} else if ctrl.Model == "pcie-root-port" && strings.HasPrefix(aliasName, NUMAHotplugRootPortAliasPrefix) {
+				if ctrl.Target != nil && ctrl.Target.BusNr != "" {
+					if busNr, err2 := parseBusNumber(ctrl.Target.BusNr); err2 == nil {
+						planner.reservePCIBus(busNr)
+					}
+				}
+				if ctrl.Address != nil && ctrl.Address.Slot != "" {
+					if slotVal, err2 := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err2 == nil {
+						slot := int(slotVal)
+						planner.markBusSlot(rootBusControllerMarker, 0, slot)
+						if slot >= planner.nextRootHotplugSlot {
+							planner.nextRootHotplugSlot = slot + 1
+						}
+					}
+				}
+				if ctrl.Target != nil && ctrl.Target.Port != "" {
+					if portVal, err2 := strconv.ParseInt(strings.TrimPrefix(ctrl.Target.Port, "0x"), 16, 32); err2 == nil {
+						port := int(portVal)
+						if port >= planner.nextRootHotplugPort {
+							planner.nextRootHotplugPort = port + 1
+						}
 					}
 				}
 			}
@@ -630,6 +664,97 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 		controllerIndex: index,
 		downstreamBus:   downstreamBus,
 	}, nil
+}
+
+func (p *numaPCIPlanner) ensureRootHotplugCapacity(minPorts int) error {
+	if minPorts <= 0 {
+		return nil
+	}
+
+	existing := 0
+	for i := range p.domain.Spec.Devices.Controllers {
+		ctrl := p.domain.Spec.Devices.Controllers[i]
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil && strings.HasPrefix(ctrl.Alias.GetName(), NUMAHotplugRootPortAliasPrefix) {
+			existing++
+		}
+	}
+
+	if existing >= minPorts {
+		return nil
+	}
+
+	for idx := existing; idx < minPorts; idx++ {
+		alias := fmt.Sprintf("%s-%d", NUMAHotplugRootPortAliasPrefix, idx)
+		if err := p.addRootHotplugPort(alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *numaPCIPlanner) addRootHotplugPort(alias string) error {
+	slot, err := p.allocateRootHotplugSlot()
+	if err != nil {
+		return err
+	}
+
+	chassis := p.allocateChassis()
+	if chassis < 0 {
+		return fmt.Errorf("no more chassis numbers available for hotplug root ports")
+	}
+
+	portHex := fmt.Sprintf("0x%x", p.nextRootHotplugPort)
+	p.nextRootHotplugPort++
+
+	downstreamBus, err := p.allocatePCIBusNumber()
+	if err != nil {
+		return err
+	}
+
+	index := p.nextControllerIndex
+	p.nextControllerIndex++
+
+	controller := api.Controller{
+		Type:  "pci",
+		Index: strconv.Itoa(index),
+		Model: "pcie-root-port",
+		Target: &api.ControllerTarget{
+			Chassis: strconv.Itoa(chassis),
+			Port:    portHex,
+			BusNr:   strconv.Itoa(downstreamBus),
+		},
+		Alias: api.NewUserDefinedAlias(alias),
+		Address: &api.Address{
+			Type:     api.AddressPCI,
+			Domain:   rootBusDomain,
+			Bus:      "0x00",
+			Slot:     fmt.Sprintf("0x%02x", slot),
+			Function: "0x0",
+		},
+	}
+
+	p.markBusSlot(rootBusControllerMarker, 0, slot)
+	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
+	log.Log.V(1).Infof("NUMA PCI Planner: Created NUMA hotplug root port index=%d, slot=0x%02x", index, slot)
+	return nil
+}
+
+func (p *numaPCIPlanner) allocateRootHotplugSlot() (int, error) {
+	start := p.nextRootHotplugSlot
+	if start < rootHotplugSlotStart {
+		start = rootHotplugSlotStart
+	}
+	for slot := start; slot <= maxRootBusSlot; slot++ {
+		if slot == 0x1b || slot == 0x1f {
+			continue
+		}
+		if p.isBusSlotUsed(rootBusControllerMarker, 0, slot) {
+			continue
+		}
+		p.nextRootHotplugSlot = slot + 1
+		return slot, nil
+	}
+	return -1, fmt.Errorf("no more slots available on root bus for hotplug root ports")
 }
 
 func (p *numaPCIPlanner) allocateRootSlot() int {
