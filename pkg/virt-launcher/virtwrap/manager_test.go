@@ -67,7 +67,6 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/arch"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/vcpu"
-	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/device/hostdevice"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/efi"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/stats"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/testing"
@@ -3998,23 +3997,6 @@ var _ = Describe("calculateHotplugPortCount", func() {
 		Entry("with 3G memory and 16 ports in use", uint64(3*gb), 16, 6),
 	)
 
-	It("should return 0 when required hotplug root ports already exist", func() {
-		vmi := newVMI("testns", "kubevirt")
-		domainSpec := domainWithDevices(10)
-		domainSpec.Memory.Value = 3 * gb
-
-		for i := 0; i < hotplugLargeMemoryMinRequiredFreePorts; i++ {
-			domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
-				Type:  "pci",
-				Model: "pcie-root-port",
-				Alias: api.NewUserDefinedAlias(fmt.Sprintf("%s-%d", hostdevice.HotplugRootPortAliasPrefix, i)),
-			})
-		}
-
-		count, err := calculateHotplugPortCount(vmi, domainSpec)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(count).To(Equal(0))
-	})
 })
 
 func newVMI(namespace, name string) *v1.VirtualMachineInstance {

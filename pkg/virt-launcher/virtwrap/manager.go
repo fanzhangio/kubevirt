@@ -1519,6 +1519,7 @@ func (l *LibvirtDomainManager) allocateHotplugPorts(
 	logger.V(1).Infof("Allocating %d hotplug ports", count)
 
 	setDomainFn := func(v *v1.VirtualMachineInstance, s *api.DomainSpec) (cli.VirDomain, error) {
+		normalizeHotplugRootPortAddresses(s)
 		return l.setDomainSpecWithHooks(v, s)
 	}
 
@@ -2836,27 +2837,121 @@ func calculateHotplugPortCount(vmi *v1.VirtualMachineInstance, domainSpec *api.D
 		return 0, err
 	}
 
-	requested := max(defaultTotalPorts-portsInUse, minFreePorts)
-	existing := countHotplugRootPorts(domainSpec)
-	missing := requested - existing
-	if missing < 0 {
-		missing = 0
+	requested := defaultTotalPorts - portsInUse
+	if requested < minFreePorts {
+		requested = minFreePorts
 	}
-	return missing, nil
+	return requested, nil
 }
 
-func countHotplugRootPorts(domainSpec *api.DomainSpec) int {
-	if domainSpec == nil {
-		return 0
+const (
+	rootHotplugBusHex             = "0x00"
+	rootHotplugDomainHex          = "0x0000"
+	hotplugRootPortAliasPrefix    = "ua-hotplug-rp-"
+	rootHotplugSlotStart          = 0x10
+	rootReservedSlotDefaultBridge = 0x01
+	rootReservedSlotICH9Sound     = 0x1b
+	rootReservedSlotSATA          = 0x1f
+)
+
+func normalizeHotplugRootPortAddresses(spec *api.DomainSpec) {
+	if spec == nil {
+		return
 	}
-	count := 0
-	for _, ctrl := range domainSpec.Devices.Controllers {
+
+	usedSlots := map[int]struct{}{
+		rootReservedSlotDefaultBridge: {},
+		rootReservedSlotICH9Sound:     {},
+		rootReservedSlotSATA:          {},
+	}
+
+	controllers := spec.Devices.Controllers
+	for i := range controllers {
+		ctrl := controllers[i]
+		if ctrl.Address == nil {
+			continue
+		}
+		bus, err := parseHexByte(ctrl.Address.Bus)
+		if err != nil || bus != 0 {
+			continue
+		}
+		slot, err := parseHexByte(ctrl.Address.Slot)
+		if err != nil {
+			continue
+		}
+		usedSlots[slot] = struct{}{}
+	}
+
+	nextSlot := rootHotplugSlotStart
+
+	for i := range controllers {
+		ctrl := &spec.Devices.Controllers[i]
 		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
 			continue
 		}
-		if strings.HasPrefix(ctrl.Alias.GetName(), hostdevice.HotplugRootPortAliasPrefix) {
-			count++
+		if !strings.HasPrefix(ctrl.Alias.GetName(), hotplugRootPortAliasPrefix) {
+			continue
+		}
+
+		if ctrl.Address == nil {
+			ctrl.Address = &api.Address{}
+		}
+
+		ctrl.Address.Domain = rootHotplugDomainHex
+		ctrl.Address.Bus = rootHotplugBusHex
+
+		slot, err := parseHexByte(ctrl.Address.Slot)
+		if err != nil || !isRootHotplugSlotAvailable(slot, usedSlots) {
+			slot = nextAvailableRootHotplugSlot(nextSlot, usedSlots)
+		}
+		ctrl.Address.Slot = fmt.Sprintf("0x%02x", slot)
+		ctrl.Address.Function = "0x0"
+		usedSlots[slot] = struct{}{}
+		if slot >= nextSlot {
+			nextSlot = slot + 1
 		}
 	}
-	return count
+}
+
+func parseHexByte(value string) (int, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return -1, fmt.Errorf("empty value")
+	}
+	if strings.HasPrefix(trimmed, "0x") || strings.HasPrefix(trimmed, "0X") {
+		v, err := strconv.ParseInt(trimmed[2:], 16, 32)
+		return int(v), err
+	}
+	v, err := strconv.ParseInt(trimmed, 16, 32)
+	return int(v), err
+}
+
+func isRootHotplugSlotAvailable(slot int, used map[int]struct{}) bool {
+	if slot < 0 {
+		return false
+	}
+	if slot == rootReservedSlotDefaultBridge || slot == rootReservedSlotICH9Sound || slot == rootReservedSlotSATA {
+		return false
+	}
+	if _, taken := used[slot]; taken {
+		return false
+	}
+	return true
+}
+
+func nextAvailableRootHotplugSlot(start int, used map[int]struct{}) int {
+	if start < rootHotplugSlotStart {
+		start = rootHotplugSlotStart
+	}
+	for slot := start; slot <= rootReservedSlotSATA; slot++ {
+		if isRootHotplugSlotAvailable(slot, used) {
+			return slot
+		}
+	}
+	for slot := rootHotplugSlotStart; slot < start; slot++ {
+		if isRootHotplugSlotAvailable(slot, used) {
+			return slot
+		}
+	}
+	return start
 }
