@@ -4081,6 +4081,22 @@ var _ = Describe("calculateHotplugPortCount", func() {
 
 })
 
+var _ = Describe("isRootPortSlotExhaustionError", func() {
+	It("detects slot exhaustion errors", func() {
+		err := fmt.Errorf("virError(Code=1, Domain=20, Message='%s')", pciRootPortExhaustionMessage)
+		Expect(isRootPortSlotExhaustionError(err)).To(BeTrue())
+	})
+
+	It("ignores other libvirt errors", func() {
+		err := fmt.Errorf("virError(Code=1, Domain=20, Message='something else')")
+		Expect(isRootPortSlotExhaustionError(err)).To(BeFalse())
+	})
+
+	It("returns false for nil", func() {
+		Expect(isRootPortSlotExhaustionError(nil)).To(BeFalse())
+	})
+})
+
 func newVMI(namespace, name string) *v1.VirtualMachineInstance {
 	vmi := api2.NewMinimalVMIWithNS(namespace, name)
 	v1.SetObjectDefaults_VirtualMachineInstance(vmi)

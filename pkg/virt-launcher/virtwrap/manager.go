@@ -1523,14 +1523,28 @@ func (l *LibvirtDomainManager) allocateHotplugPorts(
 		return l.setDomainSpecWithHooks(v, s)
 	}
 
-	// leverage existing hotplug nic code to allocate ports
-	// should work for disks and any other devices as well
-	dom, err := network.WithNetworkIfacesResources(vmi, domainSpec, count, setDomainFn)
-	if err != nil {
-		return nil, err
+	requestedPorts := count
+	for ports := requestedPorts; ports >= 0; ports-- {
+		if ports != requestedPorts {
+			logger.Warningf("Retrying hotplug port allocation with %d ports due to root bus slot exhaustion", ports)
+		}
+
+		// leverage existing hotplug nic code to allocate ports
+		// should work for disks and any other devices as well
+		dom, err := network.WithNetworkIfacesResources(vmi, domainSpec, ports, setDomainFn)
+		if err == nil {
+			if ports < requestedPorts {
+				logger.V(1).Infof("Continuing with %d hotplug ports after libvirt slot exhaustion", ports)
+			}
+			return dom, nil
+		}
+
+		if !isRootPortSlotExhaustionError(err) || ports == 0 {
+			return nil, err
+		}
 	}
 
-	return dom, nil
+	return nil, fmt.Errorf("failed to allocate hotplug ports")
 }
 
 func getSourceFile(disk api.Disk) string {
@@ -3040,4 +3054,13 @@ func nextAvailableRootHotplugSlot(start int, used map[int]struct{}) int {
 
 func isHotplugRootPortAlias(alias string) bool {
 	return hostdevice.IsHotplugRootPortAlias(alias)
+}
+
+const pciRootPortExhaustionMessage = "a PCI slot is needed to connect a PCI controller model='pcie-root-port'"
+
+func isRootPortSlotExhaustionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), pciRootPortExhaustionMessage)
 }
