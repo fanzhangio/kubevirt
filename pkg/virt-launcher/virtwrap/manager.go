@@ -2866,6 +2866,12 @@ func calculateHotplugPortCount(vmi *v1.VirtualMachineInstance, domainSpec *api.D
 		return 0, nil
 	}
 
+	// When NUMA host device topology is active, disable hotplug to avoid PCI slot conflicts
+	if hasNUMAHostDeviceTopology(vmi, domainSpec) {
+		log.Log.Object(vmi).V(1).Info("Disabling hotplug ports due to active NUMA host device topology")
+		return 0, nil
+	}
+
 	defaultTotalPorts := hotplugDefaultTotalPorts
 	minFreePorts := hotplugMinRequiredFreePorts
 
@@ -3092,6 +3098,32 @@ func isRootPortSlotExhaustionError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), pciRootPortExhaustionMessage)
+}
+
+// hasNUMAHostDeviceTopology checks if NUMA host device topology is active
+func hasNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domainSpec *api.DomainSpec) bool {
+	// Check if NUMA CPU passthrough is enabled (required for NUMA host device topology)
+	if vmi.Spec.Domain.CPU == nil ||
+		vmi.Spec.Domain.CPU.NUMA == nil ||
+		vmi.Spec.Domain.CPU.NUMA.GuestMappingPassthrough == nil {
+		return false
+	}
+
+	// Check if there are host devices present
+	if domainSpec == nil || len(domainSpec.Devices.HostDevices) == 0 {
+		return false
+	}
+
+	// Check if any PXB controllers exist (indicates NUMA topology was applied)
+	for _, ctrl := range domainSpec.Devices.Controllers {
+		if ctrl.Model == "pcie-expander-bus" && ctrl.Alias != nil {
+			if strings.HasPrefix(ctrl.Alias.GetName(), "numa-pxb") {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func isLibvirtConnectionError(err error) bool {

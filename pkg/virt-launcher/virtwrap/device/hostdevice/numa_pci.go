@@ -17,19 +17,21 @@ import (
 const (
 	rootBusDomain           = "0x0000"
 	defaultPXBSlot          = 0x0a
+	maxPXBSlot              = 0x0f // PXB slots must stay below hotplug range
 	maxRootBusSlot          = 0x1f
 	maxRootPortSlot         = 0x1f
-	minPCIBusNumber         = 0x80 // Start PXB bus numbers higher to avoid conflicts
+	pxbBusNumberBase        = 0x20 // Base bus number for PXB hierarchies (32, 64, 96, etc.)
+	pxbBusNumberSpacing     = 0x20 // Space between PXB bus numbers (32 buses per hierarchy)
 	maxPCIBusNumber         = 0xfe
 	unifiedNUMAGroup        = 0
 	rootBusControllerMarker = -1
+	rootPortsPerSlot        = 8 // Number of root port functions per PXB slot
 
 	numaPXBAliasPrefix  = "numa-pxb"
 	numaRootPortPrefix  = "numa-rp"
 	rootPortAliasLength = 12
 
 	rootHotplugSlotStart           = 0x10
-	defaultHotplugRootPorts        = 6
 	HotplugRootPortAliasPrefix     = "hotplug-rp-"
 	numaHotplugAliasDiscriminator  = "numa-"
 	NUMAHotplugRootPortAliasPrefix = HotplugRootPortAliasPrefix + numaHotplugAliasDiscriminator
@@ -87,10 +89,11 @@ type numaPCIPlanner struct {
 }
 
 type pxbInfo struct {
-	index         int
-	busNr         int
-	nextPortSlot  int
-	nextPortValue int
+	index            int
+	busNr            int
+	nextPortSlot     int
+	nextPortFunction int // Track function number for multifunction ports
+	portsCreated     int // Count of ports created for this PXB
 }
 
 type rootPortInfo struct {
@@ -311,6 +314,13 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 		requestedDevices[info.bdf] = struct{}{}
 	}
 
+	// Pre-reserve PXB bus numbers to prevent conflicts with sequential allocation
+	// This must be done before any root port creation to avoid bus number collisions
+	planner.reservePXBBusNumbers(groupKeys)
+
+	// Add a default root port for general-purpose device assignment
+	planner.addDefaultRootPort()
+
 	for _, key := range groupKeys {
 		infos := grouped[key]
 		if len(infos) == 0 {
@@ -360,7 +370,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	planner := &numaPCIPlanner{
 		domain:              domain,
 		nextPXBSlot:         defaultPXBSlot,
-		nextPCIBus:          minPCIBusNumber,
+		nextPCIBus:          pxbBusNumberBase,
 		usedBusSlots:        map[busSlotKey]map[int]struct{}{},
 		usedNUMAChassis:     map[int]struct{}{},
 		usedPCIBuses:        map[int]struct{}{},
@@ -374,12 +384,17 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 	}
 
 	maxIndex := -1
+	hasPCIeRoot := false
 	for i := range domain.Spec.Devices.Controllers {
 		ctrl := domain.Spec.Devices.Controllers[i]
 		planner.reserveRootSlotIfNeeded(ctrl.Address)
 		idx, err := strconv.Atoi(ctrl.Index)
 		if err == nil && idx > maxIndex {
 			maxIndex = idx
+		}
+		// Check if pcie-root (index 0) is already explicitly defined
+		if idx == 0 && ctrl.Model == "pcie-root" {
+			hasPCIeRoot = true
 		}
 		if ctrl.Address != nil {
 			parentIdx := parseControllerIndex(ctrl.Address.Controller, rootBusControllerMarker)
@@ -389,7 +404,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 					if slotVal, err := strconv.ParseInt(strings.TrimPrefix(ctrl.Address.Slot, "0x"), 16, 32); err == nil {
 						planner.markBusSlot(parentIdx, busVal, int(slotVal))
 						if parentIdx == rootBusControllerMarker && busVal == 0 &&
-							int(slotVal) >= planner.nextPXBSlot && int(slotVal) < rootHotplugSlotStart {
+							int(slotVal) >= planner.nextPXBSlot && int(slotVal) <= maxPXBSlot {
 							planner.nextPXBSlot = int(slotVal) + 1
 						}
 					}
@@ -417,10 +432,11 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 				if ctrl.Target != nil && ctrl.Target.BusNr != "" {
 					if busNr, err2 := parseBusNumber(ctrl.Target.BusNr); err2 == nil {
 						planner.existingPXBs[aliasName] = &pxbInfo{
-							index:         idx,
-							busNr:         busNr,
-							nextPortSlot:  0,
-							nextPortValue: 0,
+							index:            idx,
+							busNr:            busNr,
+							nextPortSlot:     0,
+							nextPortFunction: 0,
+							portsCreated:     0,
 						}
 					}
 				}
@@ -516,20 +532,43 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 
 	for alias, info := range planner.existingPXBs {
 		info.nextPortSlot = planner.nextFreeSlot(info.index, info.busNr)
-		info.nextPortValue = len(planner.usedBusSlots[busSlotKey{controller: info.index, bus: info.busNr}])
+		info.portsCreated = len(planner.usedBusSlots[busSlotKey{controller: info.index, bus: info.busNr}])
 		planner.existingPXBs[alias] = info
 	}
 
 	planner.nextControllerIndex = maxIndex + 1
-	if planner.nextPXBSlot > maxRootBusSlot {
-		planner.nextPXBSlot = maxRootBusSlot
+	if planner.nextPXBSlot > maxPXBSlot {
+		planner.nextPXBSlot = maxPXBSlot
 	}
-	if planner.nextPCIBus < minPCIBusNumber {
-		planner.nextPCIBus = minPCIBusNumber
+	if planner.nextPCIBus < pxbBusNumberBase {
+		planner.nextPCIBus = pxbBusNumberBase
 	}
 
-	// Reserve the default q35 root port slot (0x01) on the primary root bus to avoid collisions
-	planner.markBusSlot(rootBusControllerMarker, 0, 0x01)
+	// Reserve slot 0x00 for pcie-root controller
+	planner.markBusSlot(rootBusControllerMarker, 0, 0x00)
+
+	// Note: We do NOT reserve Q35 built-in device slots (0x1b, 0x1f, etc.) because:
+	// 1. These are implicit devices that libvirt/QEMU create automatically
+	// 2. Libvirt already knows about them and will avoid them during address allocation
+	// 3. Explicitly marking them here can interfere with hotplug port allocation (0x10-0x1f range)
+	// 4. Our planner only needs to track slots for controllers we explicitly create
+
+	// Ensure pcie-root controller (index 0) is explicitly defined when needed
+	// This is required when other controllers explicitly reference it with controller="0"
+	if !hasPCIeRoot && maxIndex >= 0 {
+		log.Log.V(1).Info("NUMA PCI Planner: Adding explicit pcie-root controller (index 0)")
+		pcieRoot := api.Controller{
+			Type:  "pci",
+			Index: "0",
+			Model: "pcie-root",
+		}
+		// Prepend to ensure index 0 comes first
+		domain.Spec.Devices.Controllers = append([]api.Controller{pcieRoot}, domain.Spec.Devices.Controllers...)
+	}
+
+	log.Log.V(1).Infof("NUMA PCI Planner: PXB slots available: 0x%02x-0x%02x, reserved root slots: 0x01,0x1b-0x1f",
+		defaultPXBSlot, maxPXBSlot)
+
 	return planner
 }
 
@@ -544,10 +583,11 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 	alias := pxbAlias(hostNUMA, guestNUMA)
 	if existing, ok := p.existingPXBs[alias]; ok {
 		info := &pxbInfo{
-			index:         existing.index,
-			busNr:         existing.busNr,
-			nextPortSlot:  p.nextFreeSlot(existing.index, existing.busNr),
-			nextPortValue: len(p.usedBusSlots[busSlotKey{controller: existing.index, bus: existing.busNr}]),
+			index:            existing.index,
+			busNr:            existing.busNr,
+			nextPortSlot:     p.nextFreeSlot(existing.index, existing.busNr),
+			nextPortFunction: 0,
+			portsCreated:     len(p.usedBusSlots[busSlotKey{controller: existing.index, bus: existing.busNr}]),
 		}
 		p.pxbs[key] = info
 		return info, nil
@@ -557,13 +597,17 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 
 	slot := p.allocateRootSlot()
 	if slot < 0 {
-		return nil, fmt.Errorf("no slots available for PCI expander bus")
+		return nil, fmt.Errorf("no PXB slots available on root bus (slots 0x%02x-0x%02x reserved for hotplug)", rootHotplugSlotStart, maxRootBusSlot)
 	}
 
-	busNr, err := p.allocatePCIBusNumber()
-	if err != nil {
-		return nil, err
+	// Calculate well-separated bus number: base + (hostNUMA * spacing)
+	// This gives: NUMA 0 = 0x20 (32), NUMA 1 = 0x40 (64), NUMA 2 = 0x60 (96), etc.
+	// Provides ~32 bus numbers per hierarchy for bridges and subordinate buses
+	busNr := pxbBusNumberBase + (hostNUMA * pxbBusNumberSpacing)
+	if busNr > maxPCIBusNumber {
+		return nil, fmt.Errorf("calculated PXB bus number 0x%02x exceeds maximum 0x%02x for host NUMA %d", busNr, maxPCIBusNumber, hostNUMA)
 	}
+	p.reservePCIBus(busNr)
 
 	nodeVal := guestNUMA
 	controller := api.Controller{
@@ -590,10 +634,11 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
 
 	info := &pxbInfo{
-		index:         index,
-		busNr:         busNr,
-		nextPortSlot:  0,
-		nextPortValue: 0,
+		index:            index,
+		busNr:            busNr,
+		nextPortSlot:     0,
+		nextPortFunction: 0,
+		portsCreated:     0,
 	}
 	p.pxbs[key] = info
 	p.existingPXBs[alias] = info
@@ -623,9 +668,13 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 	index := p.nextControllerIndex
 	p.nextControllerIndex++
 
-	slot, err := p.allocatePXBRootPortSlot(info)
-	if err != nil {
-		return nil, err
+	// For multifunction ports, always use slot 0x00, incrementing function
+	slot := 0x00
+	function := info.nextPortFunction
+
+	// Validate we haven't exceeded multifunction limits
+	if function >= rootPortsPerSlot {
+		return nil, fmt.Errorf("no more root port functions available on PXB (max %d per slot)", rootPortsPerSlot)
 	}
 
 	// Find next available chassis number
@@ -633,8 +682,12 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 	if chassis < 0 {
 		return nil, fmt.Errorf("no more chassis numbers available")
 	}
-	portHex := fmt.Sprintf("0x%x", info.nextPortValue)
-	info.nextPortValue++
+
+	// Use function number as port value for target
+	portHex := fmt.Sprintf("0x%x", function)
+
+	info.nextPortFunction++
+	info.portsCreated++
 
 	downstreamBus, err := p.allocatePCIBusNumber()
 	if err != nil {
@@ -645,26 +698,35 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 		Type:  "pci",
 		Index: strconv.Itoa(index),
 		Model: "pcie-root-port",
+		ModelInfo: &api.ControllerModel{
+			Name: "pcie-root-port",
+		},
 		Target: &api.ControllerTarget{
 			Chassis: strconv.Itoa(chassis),
 			Port:    portHex,
-			BusNr:   strconv.Itoa(downstreamBus),
+			// Don't set BusNr for pcie-root-port - libvirt doesn't support it
+			// Only pci-expander-bus/pcie-expander-bus controllers use busNr
 		},
 		Alias: api.NewUserDefinedAlias(alias),
 		Address: &api.Address{
-			Type:       api.AddressPCI,
-			Domain:     rootBusDomain,
-			Controller: strconv.Itoa(info.index),
-			Bus:        fmt.Sprintf("0x%02x", info.busNr),
-			Slot:       fmt.Sprintf("0x%02x", slot),
-			Function:   "0x0",
+			Type:   api.AddressPCI,
+			Domain: rootBusDomain,
+			// Explicitly set bus to PXB's busNr - libvirt 10.10.0 doesn't honor controller attribute for root ports
+			Bus:      fmt.Sprintf("0x%02x", info.busNr),
+			Slot:     fmt.Sprintf("0x%02x", slot),
+			Function: fmt.Sprintf("0x%x", function),
 		},
+	}
+
+	// Enable multifunction for function 0 to allow additional functions on this slot
+	if function == 0 {
+		controller.Address.MultiFunction = "on"
 	}
 
 	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
 
-	log.Log.V(1).Infof("NUMA PCI Planner: Created root port index=%d, parent=index=%d(busNr=%d), slot=0x%02x",
-		index, info.index, info.busNr, slot)
+	log.Log.V(1).Infof("NUMA PCI Planner: Created root port index=%d, parent=index=%d(busNr=%d), slot=0x%02x, function=0x%x",
+		index, info.index, info.busNr, slot, function)
 
 	return &rootPortInfo{
 		controllerIndex: index,
@@ -673,7 +735,7 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 }
 
 func (p *numaPCIPlanner) allocateRootSlot() int {
-	for slot := p.nextPXBSlot; slot <= maxRootBusSlot; slot++ {
+	for slot := p.nextPXBSlot; slot <= maxPXBSlot; slot++ {
 		if !p.isBusSlotUsed(rootBusControllerMarker, 0, slot) {
 			p.markBusSlot(rootBusControllerMarker, 0, slot)
 			p.nextPXBSlot = slot + 1
@@ -681,6 +743,50 @@ func (p *numaPCIPlanner) allocateRootSlot() int {
 		}
 	}
 	return -1
+}
+
+func (p *numaPCIPlanner) addDefaultRootPort() {
+	// Add an explicit pcie-root-port on the root bus at slot 0x01
+	// Libvirt requires this for topology validation
+	index := p.nextControllerIndex
+	p.nextControllerIndex++
+
+	chassis := p.allocateChassis()
+	if chassis < 0 {
+		log.Log.Warning("Unable to allocate chassis for default root port")
+		return
+	}
+
+	// Don't allocate a bus number - libvirt will auto-assign for default root port
+
+	controller := api.Controller{
+		Type:  "pci",
+		Index: strconv.Itoa(index),
+		Model: "pcie-root-port",
+		ModelInfo: &api.ControllerModel{
+			Name: "pcie-root-port",
+		},
+		Target: &api.ControllerTarget{
+			Chassis: strconv.Itoa(chassis),
+			Port:    "0x0",
+			// Don't set BusNr for default root port - let libvirt auto-assign
+		},
+		Alias: api.NewUserDefinedAlias("default-root-port"),
+		Address: &api.Address{
+			Type:       api.AddressPCI,
+			Domain:     rootBusDomain,
+			Bus:        "0x00",
+			Slot:       "0x01",
+			Function:   "0x0",
+			Controller: "0", // Explicitly connect to pcie-root (index 0)
+		},
+	}
+
+	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, controller)
+	p.markBusSlot(rootBusControllerMarker, 0, 0x01)
+	// Don't reserve a bus number - libvirt will auto-assign
+
+	log.Log.V(1).Infof("NUMA PCI Planner: Created default root port index=%d at slot 0x01", index)
 }
 
 func (p *numaPCIPlanner) allocateChassis() int {
@@ -694,6 +800,23 @@ func (p *numaPCIPlanner) allocateChassis() int {
 	return -1
 }
 
+func (p *numaPCIPlanner) reservePXBBusNumbers(groupKeys []deviceGroupKey) {
+	// Pre-reserve bus numbers that will be used by PXBs to prevent conflicts
+	// with sequentially allocated bus numbers for other controllers
+	numaNodes := make(map[int]struct{})
+	for _, key := range groupKeys {
+		numaNodes[key.hostNUMANode] = struct{}{}
+	}
+
+	for numaNode := range numaNodes {
+		busNr := pxbBusNumberBase + (numaNode * pxbBusNumberSpacing)
+		if busNr <= maxPCIBusNumber {
+			p.reservePCIBus(busNr)
+			log.Log.V(1).Infof("NUMA PCI Planner: Pre-reserved PXB bus 0x%02x for NUMA node %d", busNr, numaNode)
+		}
+	}
+}
+
 func (p *numaPCIPlanner) reservePCIBus(bus int) {
 	if bus < 0 || bus > maxPCIBusNumber {
 		return
@@ -702,14 +825,14 @@ func (p *numaPCIPlanner) reservePCIBus(bus int) {
 		return
 	}
 	p.usedPCIBuses[bus] = struct{}{}
-	if bus >= p.nextPCIBus {
-		p.nextPCIBus = bus + 1
-	}
+	// Do NOT advance nextPCIBus here - we want sequential allocation to skip
+	// reserved buses but not jump past them. allocatePCIBusNumber() will skip
+	// over reserved buses naturally by checking usedPCIBuses.
 }
 
 func (p *numaPCIPlanner) allocatePCIBusNumber() (int, error) {
-	if p.nextPCIBus < minPCIBusNumber {
-		p.nextPCIBus = minPCIBusNumber
+	if p.nextPCIBus < pxbBusNumberBase {
+		p.nextPCIBus = pxbBusNumberBase
 	}
 	for bus := p.nextPCIBus; bus <= maxPCIBusNumber; bus++ {
 		if _, used := p.usedPCIBuses[bus]; !used {
@@ -811,9 +934,11 @@ func assignHostDeviceToRootPort(dev *api.HostDevice, port *rootPortInfo) {
 	dev.Address.Type = api.AddressPCI
 	dev.Address.Domain = rootBusDomain
 	dev.Address.Controller = strconv.Itoa(port.controllerIndex)
+	// Place device at slot 0, function 0 on the root port's downstream bus
+	// Libvirt auto-assigns the bus number for the root port's secondary side
 	dev.Address.Bus = ""
-	dev.Address.Slot = ""
-	dev.Address.Function = ""
+	dev.Address.Slot = "0x00"
+	dev.Address.Function = "0x0"
 }
 
 func resolveHostDevicePCIAddress(dev *api.HostDevice) (string, error) {
@@ -922,7 +1047,7 @@ func (p *numaPCIPlanner) reserveRootSlotIfNeeded(addr *api.Address) {
 		return
 	}
 	p.markBusSlot(rootBusControllerMarker, 0, slot)
-	if slot >= defaultPXBSlot && slot < rootHotplugSlotStart && slot >= p.nextPXBSlot {
+	if slot >= defaultPXBSlot && slot <= maxPXBSlot && slot >= p.nextPXBSlot {
 		p.nextPXBSlot = slot + 1
 	}
 }

@@ -1496,11 +1496,11 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 	if dev.Address.Controller != strconv.Itoa(port.controllerIndex) {
 		t.Fatalf("expected controller to be %d, got %s", port.controllerIndex, dev.Address.Controller)
 	}
-	if dev.Address.Slot != "" {
-		t.Fatalf("expected slot to be empty for PCI placement, got %s", dev.Address.Slot)
+	if dev.Address.Slot != "0x00" {
+		t.Fatalf("expected slot to be 0x00 for root port downstream placement, got %s", dev.Address.Slot)
 	}
-	if dev.Address.Function != "" {
-		t.Fatalf("expected function to be empty for PCI placement, got %s", dev.Address.Function)
+	if dev.Address.Function != "0x0" {
+		t.Fatalf("expected function to be 0x0 for root port downstream placement, got %s", dev.Address.Function)
 	}
 }
 
@@ -1519,11 +1519,11 @@ func TestHostDeviceAddressFormat(t *testing.T) {
 	if dev.Address.Controller != strconv.Itoa(port.controllerIndex) {
 		t.Fatalf("expected controller to be %d, got %s", port.controllerIndex, dev.Address.Controller)
 	}
-	if dev.Address.Slot != "" {
-		t.Fatalf("expected slot to be empty for PCI placement, got %s", dev.Address.Slot)
+	if dev.Address.Slot != "0x00" {
+		t.Fatalf("expected slot to be 0x00 for root port downstream placement, got %s", dev.Address.Slot)
 	}
-	if dev.Address.Function != "" {
-		t.Fatalf("expected function to be empty for PCI placement, got %s", dev.Address.Function)
+	if dev.Address.Function != "0x0" {
+		t.Fatalf("expected function to be 0x0 for root port downstream placement, got %s", dev.Address.Function)
 	}
 }
 
@@ -1933,4 +1933,105 @@ func TestNUMAPCIPlannerConflictDetection(t *testing.T) {
 	t.Logf("No slot conflicts detected")
 	t.Logf("No chassis conflicts detected")
 	t.Logf("No controller index conflicts detected")
+}
+
+func TestNUMAPCIPlannerBusNumberAllocation(t *testing.T) {
+	t.Parallel()
+
+	// Create a domain with no controllers - planner will add everything
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			Devices: api.Devices{
+				Controllers: []api.Controller{},
+			},
+		},
+	}
+
+	planner := newNUMAPCIPlanner(domain)
+
+	// Simulate what ApplyNUMAHostDeviceTopology does:
+	// 1. Reserve PXB bus numbers for NUMA 0 and 1
+	groupKeys := []deviceGroupKey{
+		{hostNUMANode: 0, guestNUMANode: 0, pathKey: "path0"},
+		{hostNUMANode: 1, guestNUMANode: 1, pathKey: "path1"},
+	}
+	planner.reservePXBBusNumbers(groupKeys)
+
+	// 2. Add default root port
+	planner.addDefaultRootPort()
+
+	// 3. Create PXBs
+	pxb0, err := planner.ensurePXB(0, 0)
+	if err != nil {
+		t.Fatalf("Failed to create PXB for NUMA 0: %v", err)
+	}
+	_, err = planner.ensurePXB(1, 1)
+	if err != nil {
+		t.Fatalf("Failed to create PXB for NUMA 1: %v", err)
+	}
+
+	// 4. Add some root ports to consume bus numbers
+	for i := 0; i < 3; i++ {
+		alias := fmt.Sprintf("rp-numa0-%d", i)
+		_, err := planner.addRootPort(pxb0, alias)
+		if err != nil {
+			t.Fatalf("Failed to add root port %s: %v", alias, err)
+		}
+	}
+
+	// Collect all bus numbers used
+	busNumbers := make(map[int]string) // bus number -> controller description
+	var defaultRootPortBus int = -1
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Target != nil && ctrl.Target.BusNr != "" {
+			busNr, err := strconv.Atoi(ctrl.Target.BusNr)
+			if err == nil {
+				desc := fmt.Sprintf("Controller index=%s model=%s alias=%s",
+					ctrl.Index, ctrl.Model, ctrl.Alias.GetName())
+				if existing, exists := busNumbers[busNr]; exists {
+					t.Fatalf("Bus number %d (0x%02x) used by multiple controllers:\n  %s\n  %s",
+						busNr, busNr, existing, desc)
+				}
+				busNumbers[busNr] = desc
+
+				// Track default root port bus
+				if ctrl.Alias != nil && ctrl.Alias.GetName() == "default-root-port" {
+					defaultRootPortBus = busNr
+				}
+			}
+		}
+	}
+
+	// Verify PXB buses are at expected locations
+	pxbNuma0Bus := pxbBusNumberBase + (0 * pxbBusNumberSpacing) // 0x20 = 32
+	pxbNuma1Bus := pxbBusNumberBase + (1 * pxbBusNumberSpacing) // 0x40 = 64
+
+	if _, exists := busNumbers[pxbNuma0Bus]; !exists {
+		t.Errorf("Expected PXB bus 0x%02x (%d) for NUMA 0 not found", pxbNuma0Bus, pxbNuma0Bus)
+	}
+	if _, exists := busNumbers[pxbNuma1Bus]; !exists {
+		t.Errorf("Expected PXB bus 0x%02x (%d) for NUMA 1 not found", pxbNuma1Bus, pxbNuma1Bus)
+	}
+
+	// Verify default root port does NOT have a busNr in its target
+	// The default root port lets libvirt auto-assign the downstream bus number
+	// because specifying busNr is not supported (or required) for simple root ports
+	if defaultRootPortBus >= 0 {
+		t.Errorf("Default root port should not have busNr in target, but got 0x%02x (%d)",
+			defaultRootPortBus, defaultRootPortBus)
+	}
+
+	// Verify PXB buses use their pre-calculated values (not affected by sequential allocation)
+	if _, exists := busNumbers[pxbNuma0Bus]; !exists {
+		t.Errorf("PXB NUMA 0 bus 0x%02x was not allocated correctly", pxbNuma0Bus)
+	}
+	if _, exists := busNumbers[pxbNuma1Bus]; !exists {
+		t.Errorf("PXB NUMA 1 bus 0x%02x was not allocated correctly", pxbNuma1Bus)
+	}
+
+	t.Logf("✓ Bus allocation verified correctly:")
+	t.Logf("  Default root port: no busNr (libvirt auto-assigns)")
+	t.Logf("  PXB NUMA 0: 0x%02x (%d)", pxbNuma0Bus, pxbNuma0Bus)
+	t.Logf("  PXB NUMA 1: 0x%02x (%d)", pxbNuma1Bus, pxbNuma1Bus)
+	t.Logf("  Total controllers: %d", len(domain.Spec.Devices.Controllers))
 }

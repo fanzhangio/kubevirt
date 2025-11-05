@@ -1184,19 +1184,20 @@ type GraphicsListen struct {
 }
 
 type Address struct {
-	Type       string `xml:"type,attr"`
-	Domain     string `xml:"domain,attr,omitempty"`
-	Bus        string `xml:"bus,attr,omitempty"`
-	Slot       string `xml:"slot,attr,omitempty"`
-	Function   string `xml:"function,attr,omitempty"`
-	Controller string `xml:"controller,attr,omitempty"`
-	Target     string `xml:"target,attr,omitempty"`
-	Unit       string `xml:"unit,attr,omitempty"`
-	UUID       string `xml:"uuid,attr,omitempty"`
-	Device     string `xml:"device,attr,omitempty"`
-	CSSID      string `xml:"cssid,attr,omitempty"`
-	SSID       string `xml:"ssid,attr,omitempty"`
-	DevNo      string `xml:"devno,attr,omitempty"`
+	Type          string `xml:"type,attr"`
+	Domain        string `xml:"domain,attr,omitempty"`
+	Bus           string `xml:"bus,attr,omitempty"`
+	Slot          string `xml:"slot,attr,omitempty"`
+	Function      string `xml:"function,attr,omitempty"`
+	Controller    string `xml:"controller,attr,omitempty"`
+	Target        string `xml:"target,attr,omitempty"`
+	Unit          string `xml:"unit,attr,omitempty"`
+	UUID          string `xml:"uuid,attr,omitempty"`
+	Device        string `xml:"device,attr,omitempty"`
+	CSSID         string `xml:"cssid,attr,omitempty"`
+	SSID          string `xml:"ssid,attr,omitempty"`
+	DevNo         string `xml:"devno,attr,omitempty"`
+	MultiFunction string `xml:"multifunction,attr,omitempty"`
 }
 
 //END Video -------------------
