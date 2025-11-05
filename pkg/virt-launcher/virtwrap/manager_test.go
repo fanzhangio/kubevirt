@@ -67,7 +67,6 @@ import (
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/arch"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter/vcpu"
-	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/device/hostdevice"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/efi"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/stats"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/testing"
@@ -3946,6 +3945,98 @@ var _ = Describe("Changed Block Tracking", func() {
 	})
 })
 
+var _ = Describe("allocateHotplugPorts", func() {
+	var (
+		manager                *LibvirtDomainManager
+		originalWithNetworkIfc func(*v1.VirtualMachineInstance, *api.DomainSpec, int, func(*v1.VirtualMachineInstance, *api.DomainSpec) (cli.VirDomain, error)) (cli.VirDomain, error)
+	)
+
+	const gb = uint64(1024 * 1024 * 1024)
+
+	newDomainSpec := func(numDevices int) *api.DomainSpec {
+		spec := &api.DomainSpec{
+			Memory: api.Memory{
+				Value: gb,
+			},
+		}
+		for i := 0; i < numDevices; i++ {
+			spec.Devices.Disks = append(spec.Devices.Disks, api.Disk{
+				Target: api.DiskTarget{
+					Bus: v1.DiskBusVirtio,
+				},
+			})
+		}
+		return spec
+	}
+
+	BeforeEach(func() {
+		manager = &LibvirtDomainManager{}
+		originalWithNetworkIfc = withNetworkIfacesResources
+	})
+
+	AfterEach(func() {
+		withNetworkIfacesResources = originalWithNetworkIfc
+	})
+
+	It("retries from a clean domain spec after root port exhaustion", func() {
+		vmi := newVMI("testns", "kubevirt")
+		domainSpec := &api.DomainSpec{}
+		domainSpec.Memory.Value = 3 * 1024 * 1024 * 1024
+
+		controllersSeen := []int{}
+		attempt := 0
+
+		withNetworkIfacesResources = func(_ *v1.VirtualMachineInstance, spec *api.DomainSpec, _ int, _ func(*v1.VirtualMachineInstance, *api.DomainSpec) (cli.VirDomain, error)) (cli.VirDomain, error) {
+			controllersSeen = append(controllersSeen, len(spec.Devices.Controllers))
+
+			spec.Devices.Controllers = append(spec.Devices.Controllers, api.Controller{
+				Type:  "pci",
+				Model: "pcie-root-port",
+				Alias: api.NewUserDefinedAlias(fmt.Sprintf("ua-hotplug-%d", attempt)),
+			})
+
+			attempt++
+			if attempt == 1 {
+				return nil, fmt.Errorf("virError(Code=1, Domain=20, Message='%s')", pciRootPortExhaustionMessage)
+			}
+			return nil, nil
+		}
+
+		dom, err := manager.allocateHotplugPorts(vmi, domainSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(dom).To(BeNil())
+
+		Expect(controllersSeen).To(Equal([]int{0, 0}))
+		Expect(domainSpec.Devices.Controllers).To(HaveLen(1))
+		Expect(domainSpec.Devices.Controllers[0].Alias.GetName()).To(Equal("ua-hotplug-1"))
+	})
+
+	It("degrades the requested ports sequentially even after connection resets", func() {
+		vmi := newVMI("testns", "kubevirt")
+		domainSpec := newDomainSpec(2) // ensures calculateHotplugPortCount returns 6
+
+		var portsTried []int
+		withNetworkIfacesResources = func(_ *v1.VirtualMachineInstance, _ *api.DomainSpec, ports int, _ func(*v1.VirtualMachineInstance, *api.DomainSpec) (cli.VirDomain, error)) (cli.VirDomain, error) {
+			portsTried = append(portsTried, ports)
+			switch len(portsTried) {
+			case 1, 2:
+				return nil, fmt.Errorf("virError(Code=1, Domain=20, Message='%s')", pciRootPortExhaustionMessage)
+			case 3:
+				return nil, fmt.Errorf("rpc error: code = Unavailable desc = connection error: desc = \"connection reset by peer\"")
+			case 4:
+				return nil, fmt.Errorf("virError(Code=1, Domain=20, Message='%s')", pciRootPortExhaustionMessage)
+			default:
+				return nil, nil
+			}
+		}
+
+		dom, err := manager.allocateHotplugPorts(vmi, domainSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(dom).To(BeNil())
+		Expect(portsTried).To(Equal([]int{6, 5, 4, 3, 2}))
+	})
+})
+
 var _ = Describe("calculateHotplugPortCount", func() {
 	const gb = 1024 * 1024 * 1024
 
@@ -4007,7 +4098,7 @@ var _ = Describe("calculateHotplugPortCount", func() {
 			domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
 				Type:  "pci",
 				Model: "pcie-root-port",
-				Alias: api.NewUserDefinedAlias(fmt.Sprintf("%s-%d", hostdevice.NUMAHotplugRootPortAliasPrefix, i)),
+				Alias: api.NewUserDefinedAlias(fmt.Sprintf("numa-rp-%d", i)),
 				Address: &api.Address{
 					Type:     api.AddressPCI,
 					Domain:   "0x0000",
@@ -4032,7 +4123,7 @@ var _ = Describe("calculateHotplugPortCount", func() {
 			domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
 				Type:  "pci",
 				Model: "pcie-root-port",
-				Alias: api.NewUserDefinedAlias(fmt.Sprintf("%s%s%d", api.UserAliasPrefix, hostdevice.NUMAHotplugRootPortAliasPrefix, i)),
+				Alias: api.NewUserDefinedAlias(fmt.Sprintf("%snuma-rp-%d", api.UserAliasPrefix, i)),
 				Address: &api.Address{
 					Type:     api.AddressPCI,
 					Domain:   "0x0000",

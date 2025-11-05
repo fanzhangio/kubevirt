@@ -116,7 +116,6 @@ go_test(
         "//pkg/virt-launcher/virtwrap/converter:go_default_library",
         "//pkg/virt-launcher/virtwrap/converter/arch:go_default_library",
         "//pkg/virt-launcher/virtwrap/converter/vcpu:go_default_library",
-        "//pkg/virt-launcher/virtwrap/device/hostdevice:go_default_library",
         "//pkg/virt-launcher/virtwrap/efi:go_default_library",
         "//pkg/virt-launcher/virtwrap/errors:go_default_library",
         "//pkg/virt-launcher/virtwrap/network:go_default_library",

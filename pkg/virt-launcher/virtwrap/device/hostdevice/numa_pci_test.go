@@ -54,6 +54,26 @@ func TestIsHotplugRootPortAlias(t *testing.T) {
 	}
 }
 
+func TestIsNUMARootPortAlias(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		alias    string
+		expected bool
+	}{
+		{alias: "", expected: false},
+		{alias: "ua-numa-rp-1234", expected: true},
+		{alias: "numa-rp-abcdef", expected: true},
+		{alias: "hotplug-rp-numa-0", expected: false},
+		{alias: "ua-hotplug-rp-numa-1", expected: false},
+		{alias: "random", expected: false},
+	}
+	for _, tc := range cases {
+		if got := IsNUMARootPortAlias(tc.alias); got != tc.expected {
+			t.Fatalf("IsNUMARootPortAlias(%q) = %t, expected %t", tc.alias, got, tc.expected)
+		}
+	}
+}
+
 func TestApplyNUMAHostDeviceTopologyDisabled(t *testing.T) {
 	defer restoreNUMAHelpers()
 	getDeviceNumaNodeIntFunc = func(string) (int, error) {

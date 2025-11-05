@@ -61,6 +61,14 @@ func IsHotplugRootPortAlias(alias string) bool {
 	return strings.HasPrefix(NormalizeHotplugRootPortAlias(alias), HotplugRootPortAliasPrefix)
 }
 
+// IsNUMARootPortAlias reports whether the provided alias denotes a NUMA planner root port.
+func IsNUMARootPortAlias(alias string) bool {
+	if alias == "" {
+		return false
+	}
+	return strings.HasPrefix(NormalizeHotplugRootPortAlias(alias), numaRootPortPrefix)
+}
+
 type numaPCIPlanner struct {
 	domain              *api.Domain
 	nextControllerIndex int

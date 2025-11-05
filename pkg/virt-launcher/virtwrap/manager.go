@@ -1510,6 +1510,10 @@ func (l *LibvirtDomainManager) allocateHotplugPorts(
 ) (cli.VirDomain, error) {
 	logger := log.Log.Object(vmi)
 
+	if domainSpec == nil {
+		return nil, fmt.Errorf("domain spec is nil")
+	}
+
 	count, err := calculateHotplugPortCount(vmi, domainSpec)
 	if err != nil {
 		logger.Reason(err).Error("Failed to calculate hotplug port count")
@@ -1523,23 +1527,44 @@ func (l *LibvirtDomainManager) allocateHotplugPorts(
 		return l.setDomainSpecWithHooks(v, s)
 	}
 
+	baseSpec := domainSpec.DeepCopy()
+	if baseSpec == nil {
+		return nil, fmt.Errorf("failed to copy domain spec")
+	}
+
 	requestedPorts := count
+	observedSlotExhaustion := false
 	for ports := requestedPorts; ports >= 0; ports-- {
 		if ports != requestedPorts {
 			logger.Warningf("Retrying hotplug port allocation with %d ports due to root bus slot exhaustion", ports)
 		}
 
+		currentSpec := baseSpec.DeepCopy()
+		if currentSpec == nil {
+			return nil, fmt.Errorf("failed to copy domain spec for retry")
+		}
+
 		// leverage existing hotplug nic code to allocate ports
 		// should work for disks and any other devices as well
-		dom, err := network.WithNetworkIfacesResources(vmi, domainSpec, ports, setDomainFn)
+		dom, err := withNetworkIfacesResources(vmi, currentSpec, ports, setDomainFn)
 		if err == nil {
+			*domainSpec = *currentSpec
 			if ports < requestedPorts {
 				logger.V(1).Infof("Continuing with %d hotplug ports after libvirt slot exhaustion", ports)
 			}
 			return dom, nil
 		}
 
-		if !isRootPortSlotExhaustionError(err) || ports == 0 {
+		slotExhaustion := isRootPortSlotExhaustionError(err)
+		if slotExhaustion {
+			observedSlotExhaustion = true
+		}
+		connectionIssue := observedSlotExhaustion && isLibvirtConnectionError(err)
+		if connectionIssue && !slotExhaustion {
+			logger.Warningf("Libvirt connection issue while retrying hotplug port allocation: %v", err)
+		}
+
+		if ports == 0 || (!slotExhaustion && !connectionIssue) {
 			return nil, err
 		}
 	}
@@ -1559,7 +1584,10 @@ func getSourceFile(disk api.Disk) string {
 	return file
 }
 
-var checkIfDiskReadyToUse = checkIfDiskReadyToUseFunc
+var (
+	checkIfDiskReadyToUse      = checkIfDiskReadyToUseFunc
+	withNetworkIfacesResources = network.WithNetworkIfacesResources
+)
 
 func checkIfDiskReadyToUseFunc(filename string) (bool, error) {
 	info, err := os.Stat(filename)
@@ -2894,7 +2922,8 @@ func countExistingHotplugRootPorts(spec *api.DomainSpec) int {
 		if ctrl.Model != "pcie-root-port" || ctrl.Alias == nil {
 			continue
 		}
-		if isHotplugRootPortAlias(ctrl.Alias.GetName()) {
+		alias := ctrl.Alias.GetName()
+		if isHotplugRootPortAlias(alias) || hostdevice.IsNUMARootPortAlias(alias) {
 			count++
 		}
 	}
@@ -3063,4 +3092,14 @@ func isRootPortSlotExhaustionError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), pciRootPortExhaustionMessage)
+}
+
+func isLibvirtConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection error") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "transport endpoint is not connected")
 }
