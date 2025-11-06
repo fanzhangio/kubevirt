@@ -709,10 +709,10 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 		},
 		Alias: api.NewUserDefinedAlias(alias),
 		Address: &api.Address{
-			Type:   api.AddressPCI,
-			Domain: rootBusDomain,
-			// Explicitly set bus to PXB's busNr - libvirt 10.10.0 doesn't honor controller attribute for root ports
-			Bus:      fmt.Sprintf("0x%02x", info.busNr),
+			Type:     api.AddressPCI,
+			Domain:   rootBusDomain,
+			// Set bus to the PXB controller INDEX (not busNr!) - this tells libvirt to place the root port on the PXB
+			Bus:      strconv.Itoa(info.index),
 			Slot:     fmt.Sprintf("0x%02x", slot),
 			Function: fmt.Sprintf("0x%x", function),
 		},
