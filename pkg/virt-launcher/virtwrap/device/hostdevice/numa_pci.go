@@ -82,6 +82,7 @@ type numaPCIPlanner struct {
 	usedPCIBuses        map[int]struct{}
 	pxbs                map[pxbKey]*pxbInfo
 	rootPorts           map[deviceGroupKey]*rootPortInfo
+	pcieSwitches        map[deviceGroupKey]*pcieSwitchInfo // Track switches per device group
 	existingPXBs        map[string]*pxbInfo
 	existingRootPorts   map[string]*rootPortInfo
 	nextRootHotplugSlot int
@@ -99,6 +100,24 @@ type pxbInfo struct {
 type rootPortInfo struct {
 	controllerIndex int
 	downstreamBus   int
+	pcieSwitch      *pcieSwitchInfo // Optional: PCIe switch attached to this root port
+}
+
+// pcieSwitchInfo tracks a PCIe switch hierarchy (upstream + downstream ports)
+type pcieSwitchInfo struct {
+	upstreamPortIndex  int                       // Controller index of upstream port
+	upstreamBus        int                       // Bus number of upstream port
+	downstreamPorts    []*pcieDownstreamPortInfo // Downstream ports (typically 6)
+	nextDownstreamSlot int                       // Next available slot for downstream port
+	nextDownstreamBus  int                       // Next available bus for downstream port
+	devicesAssigned    int                       // Number of devices assigned to this switch
+}
+
+// pcieDownstreamPortInfo tracks a single downstream port on a PCIe switch
+type pcieDownstreamPortInfo struct {
+	controllerIndex int  // Controller index of this downstream port
+	downstreamBus   int  // Bus number below this downstream port
+	deviceAssigned  bool // Whether a device is assigned to this port
 }
 
 type busSlotKey struct {
@@ -341,7 +360,23 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			continue
 		}
 
-		rootPort, err := planner.ensureRootPortForGroup(pxb, key)
+		// Determine if we need a PCIe switch for this group
+		// Physical topology patterns:
+		//   - Multiple devices behind same PCIe switch (e.g., HGX with 4-6 devices per switch)
+		//     → len(infos) > 1 → Create virtual PCIe switch to mirror physical topology
+		//   - Single device directly on root port (no physical switch)
+		//     → len(infos) == 1 → No virtual switch, direct root port attachment
+		needsSwitch := len(infos) > 1
+
+		if needsSwitch {
+			log.Log.V(1).Infof("Device group has %d devices sharing path %q - will create PCIe switch (mirroring physical topology)",
+				len(infos), pathLabel)
+		} else {
+			log.Log.V(1).Infof("Device group has 1 device on path %q - will attach directly to root port (no switch needed)",
+				pathLabel)
+		}
+
+		rootPort, err := planner.ensureRootPortForGroupWithSwitch(pxb, key, needsSwitch, len(infos))
 		if err != nil {
 			log.Log.Reason(err).Error("failed to allocate root port for host device path")
 			continue
@@ -376,6 +411,7 @@ func newNUMAPCIPlanner(domain *api.Domain) *numaPCIPlanner {
 		usedPCIBuses:        map[int]struct{}{},
 		pxbs:                map[pxbKey]*pxbInfo{},
 		rootPorts:           map[deviceGroupKey]*rootPortInfo{},
+		pcieSwitches:        map[deviceGroupKey]*pcieSwitchInfo{},
 		existingPXBs:        map[string]*pxbInfo{},
 		existingRootPorts:   map[string]*rootPortInfo{},
 		nextChassis:         1,
@@ -647,6 +683,12 @@ func (p *numaPCIPlanner) ensurePXB(hostNUMA, guestNUMA int) (*pxbInfo, error) {
 }
 
 func (p *numaPCIPlanner) ensureRootPortForGroup(pxb *pxbInfo, key deviceGroupKey) (*rootPortInfo, error) {
+	return p.ensureRootPortForGroupWithSwitch(pxb, key, false, 1)
+}
+
+// ensureRootPortForGroupWithSwitch creates or retrieves a root port for the given device group,
+// optionally creating a PCIe switch if multiple devices share the same path (mirroring HGX topology)
+func (p *numaPCIPlanner) ensureRootPortForGroupWithSwitch(pxb *pxbInfo, key deviceGroupKey, needsSwitch bool, numDevices int) (*rootPortInfo, error) {
 	if existing, ok := p.rootPorts[key]; ok {
 		return existing, nil
 	}
@@ -659,6 +701,36 @@ func (p *numaPCIPlanner) ensureRootPortForGroup(pxb *pxbInfo, key deviceGroupKey
 	if err != nil {
 		return nil, err
 	}
+
+	// If this group has multiple devices sharing the same PCIe path (like physical HGX topology),
+	// create a PCIe switch to mirror the physical topology
+	if needsSwitch && numDevices > 1 {
+		log.Log.V(1).Infof("Creating PCIe switch for device group with %d devices (mirroring HGX topology)", numDevices)
+
+		// HGX switches typically have 4 downstream ports per NVIDIA documentation
+		// Use a power of 2 that fits: 2, 4, 8, 16, 32
+		numPorts := 4 // NVIDIA standard for HGX
+		if numDevices > 4 {
+			// Round up to next power of 2
+			numPorts = 8
+		}
+		if numDevices > 8 {
+			numPorts = 16
+		}
+		if numDevices > 16 {
+			numPorts = 32
+		}
+
+		switchInfo, err := p.addPCIeSwitch(rootPort, numPorts)
+		if err != nil {
+			log.Log.Reason(err).Warningf("Failed to create PCIe switch for group, falling back to direct attachment")
+		} else {
+			rootPort.pcieSwitch = switchInfo
+			p.pcieSwitches[key] = switchInfo
+			log.Log.V(1).Infof("Created PCIe switch with %d downstream ports for device group", numPorts)
+		}
+	}
+
 	p.rootPorts[key] = rootPort
 	p.existingRootPorts[alias] = rootPort
 	return rootPort, nil
@@ -709,8 +781,8 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 		},
 		Alias: api.NewUserDefinedAlias(alias),
 		Address: &api.Address{
-			Type:     api.AddressPCI,
-			Domain:   rootBusDomain,
+			Type:   api.AddressPCI,
+			Domain: rootBusDomain,
 			// Set bus to the PXB controller INDEX (not busNr!) - this tells libvirt to place the root port on the PXB
 			Bus:      strconv.Itoa(info.index),
 			Slot:     fmt.Sprintf("0x%02x", slot),
@@ -731,6 +803,127 @@ func (p *numaPCIPlanner) addRootPort(info *pxbInfo, alias string) (*rootPortInfo
 	return &rootPortInfo{
 		controllerIndex: index,
 		downstreamBus:   downstreamBus,
+	}, nil
+}
+
+// addPCIeSwitch creates a complete PCIe switch hierarchy (upstream + downstream ports)
+// attached to the specified root port. This mirrors physical HGX topology where devices
+// behind a PCIe switch share the same upstream connection.
+func (p *numaPCIPlanner) addPCIeSwitch(rootPort *rootPortInfo, numDownstreamPorts int) (*pcieSwitchInfo, error) {
+	if numDownstreamPorts < 1 || numDownstreamPorts > 32 {
+		return nil, fmt.Errorf("invalid number of downstream ports: %d (must be 1-32)", numDownstreamPorts)
+	}
+
+	// Create upstream port attached to the root port
+	upstreamIndex := p.nextControllerIndex
+	p.nextControllerIndex++
+
+	upstreamBus, err := p.allocatePCIBusNumber()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate bus number for PCIe switch upstream port: %v", err)
+	}
+
+	upstreamChassis := p.allocateChassis()
+	if upstreamChassis < 0 {
+		return nil, fmt.Errorf("failed to allocate chassis for PCIe switch upstream port")
+	}
+
+	// PCIe switch upstream port - connects to root port
+	upstreamController := api.Controller{
+		Type:  "pci",
+		Index: strconv.Itoa(upstreamIndex),
+		Model: "pcie-switch-upstream-port",
+		ModelInfo: &api.ControllerModel{
+			Name: "pcie-switch-upstream-port",
+		},
+		Target: &api.ControllerTarget{
+			Chassis: strconv.Itoa(upstreamChassis),
+			Port:    "0x0",
+		},
+		Alias: api.NewUserDefinedAlias(fmt.Sprintf("numa-switch-up-%d", upstreamIndex)),
+		Address: &api.Address{
+			Type:     api.AddressPCI,
+			Domain:   rootBusDomain,
+			Bus:      strconv.Itoa(rootPort.controllerIndex), // Attach to root port by controller index
+			Slot:     "0x00",
+			Function: "0x0",
+		},
+	}
+
+	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, upstreamController)
+
+	log.Log.V(1).Infof("NUMA PCI Planner: Created PCIe switch upstream port index=%d, chassis=%d, attached to root port controller=%d",
+		upstreamIndex, upstreamChassis, rootPort.controllerIndex)
+
+	// Create downstream ports
+	switchInfo := &pcieSwitchInfo{
+		upstreamPortIndex:  upstreamIndex,
+		upstreamBus:        upstreamBus,
+		downstreamPorts:    make([]*pcieDownstreamPortInfo, 0, numDownstreamPorts),
+		nextDownstreamSlot: 0,
+		nextDownstreamBus:  upstreamBus + 1,
+	}
+
+	for i := 0; i < numDownstreamPorts; i++ {
+		downstreamPort, err := p.addPCIeDownstreamPort(switchInfo, i)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create downstream port %d: %v", i, err)
+		}
+		switchInfo.downstreamPorts = append(switchInfo.downstreamPorts, downstreamPort)
+	}
+
+	log.Log.V(1).Infof("NUMA PCI Planner: Created PCIe switch with upstream port index=%d and %d downstream ports",
+		upstreamIndex, numDownstreamPorts)
+
+	return switchInfo, nil
+}
+
+// addPCIeDownstreamPort creates a single PCIe switch downstream port
+func (p *numaPCIPlanner) addPCIeDownstreamPort(switchInfo *pcieSwitchInfo, portNum int) (*pcieDownstreamPortInfo, error) {
+	downstreamIndex := p.nextControllerIndex
+	p.nextControllerIndex++
+
+	downstreamBus, err := p.allocatePCIBusNumber()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate bus number for downstream port %d: %v", portNum, err)
+	}
+
+	downstreamChassis := p.allocateChassis()
+	if downstreamChassis < 0 {
+		return nil, fmt.Errorf("failed to allocate chassis for downstream port %d", portNum)
+	}
+
+	// PCIe switch downstream port - connects to upstream port
+	downstreamController := api.Controller{
+		Type:  "pci",
+		Index: strconv.Itoa(downstreamIndex),
+		Model: "pcie-switch-downstream-port",
+		ModelInfo: &api.ControllerModel{
+			Name: "pcie-switch-downstream-port",
+		},
+		Target: &api.ControllerTarget{
+			Chassis: strconv.Itoa(downstreamChassis),
+			Port:    fmt.Sprintf("0x%x", portNum),
+		},
+		Alias: api.NewUserDefinedAlias(fmt.Sprintf("numa-switch-down-%d-%d", switchInfo.upstreamPortIndex, portNum)),
+		Address: &api.Address{
+			Type:     api.AddressPCI,
+			Domain:   rootBusDomain,
+			Bus:      strconv.Itoa(switchInfo.upstreamPortIndex), // Attach to upstream port by controller index
+			Slot:     fmt.Sprintf("0x%02x", portNum),
+			Function: "0x0",
+		},
+	}
+
+	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, downstreamController)
+
+	log.Log.V(1).Infof("NUMA PCI Planner: Created PCIe switch downstream port index=%d, port=%d, chassis=%d, attached to upstream controller=%d",
+		downstreamIndex, portNum, downstreamChassis, switchInfo.upstreamPortIndex)
+
+	return &pcieDownstreamPortInfo{
+		controllerIndex: downstreamIndex,
+		downstreamBus:   downstreamBus,
+		deviceAssigned:  false,
 	}, nil
 }
 
@@ -933,10 +1126,33 @@ func assignHostDeviceToRootPort(dev *api.HostDevice, port *rootPortInfo) {
 	}
 	dev.Address.Type = api.AddressPCI
 	dev.Address.Domain = rootBusDomain
-	dev.Address.Controller = strconv.Itoa(port.controllerIndex)
-	// Place device at slot 0, function 0 on the root port's downstream bus
-	// Libvirt auto-assigns the bus number for the root port's secondary side
-	dev.Address.Bus = ""
+
+	// If the root port has a PCIe switch, assign device to next available downstream port
+	if port.pcieSwitch != nil {
+		// Find next available downstream port
+		for _, downstreamPort := range port.pcieSwitch.downstreamPorts {
+			if !downstreamPort.deviceAssigned {
+				// Use Bus attribute with the downstream port's index (NVIDIA docs pattern)
+				// Example from NVIDIA: <address type='pci' domain='0x0000' bus='22' slot='0x00' function='0x0'/>
+				// where bus='22' is the index of the downstream port controller
+				dev.Address.Bus = strconv.Itoa(downstreamPort.controllerIndex)
+				dev.Address.Slot = "0x00"
+				dev.Address.Function = "0x0"
+				downstreamPort.deviceAssigned = true
+				port.pcieSwitch.devicesAssigned++
+				log.Log.V(1).Infof("Assigned device to PCIe switch downstream port index=%d (total devices on switch: %d/%d)",
+					downstreamPort.controllerIndex, port.pcieSwitch.devicesAssigned, len(port.pcieSwitch.downstreamPorts))
+				return
+			}
+		}
+		log.Log.Warningf("No available downstream ports on PCIe switch, falling back to direct root port attachment")
+	}
+
+	// No switch or switch full: attach directly to root port
+	// Use Bus attribute with the root port's index (NVIDIA docs pattern)
+	// Example: <address type='pci' domain='0x0000' bus='17' slot='0x00' function='0x0'/>
+	// where bus='17' is the index of the root port controller
+	dev.Address.Bus = strconv.Itoa(port.controllerIndex)
 	dev.Address.Slot = "0x00"
 	dev.Address.Function = "0x0"
 }

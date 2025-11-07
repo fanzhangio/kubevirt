@@ -226,11 +226,12 @@ func TestApplyNUMAHostDeviceTopologyCreatesPXBs(t *testing.T) {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
 		}
-		if dev.Address.Controller == "" {
-			t.Fatalf("expected host device %d to reference a root port controller", i)
+		// devices should use Bus attribute, not controller
+		if dev.Address.Bus == "" {
+			t.Fatalf("expected host device %d to have bus assigned (NVIDIA docs pattern)", i)
 		}
-		if dev.Address.Bus != "" {
-			t.Fatalf("expected host device %d to leave bus assignment to libvirt, got %s", i, dev.Address.Bus)
+		if dev.Address.Controller != "" {
+			t.Fatalf("expected host device %d to leave controller empty (using Bus instead), got %s", i, dev.Address.Controller)
 		}
 	}
 }
@@ -1490,11 +1491,12 @@ func TestAssignHostDeviceToRootPort(t *testing.T) {
 	if dev.Address.Domain != "0x0000" {
 		t.Fatalf("expected domain to be 0x0000, got %s", dev.Address.Domain)
 	}
-	if dev.Address.Bus != "" {
-		t.Fatalf("expected bus to be empty for automatic placement, got %s", dev.Address.Bus)
+	// After fix to match NVIDIA documentation: devices use Bus attribute (not Controller)
+	if dev.Address.Bus != strconv.Itoa(port.controllerIndex) {
+		t.Fatalf("expected bus to be %d (NVIDIA docs pattern), got %s", port.controllerIndex, dev.Address.Bus)
 	}
-	if dev.Address.Controller != strconv.Itoa(port.controllerIndex) {
-		t.Fatalf("expected controller to be %d, got %s", port.controllerIndex, dev.Address.Controller)
+	if dev.Address.Controller != "" {
+		t.Fatalf("expected controller to be empty (using Bus instead), got %s", dev.Address.Controller)
 	}
 	if dev.Address.Slot != "0x00" {
 		t.Fatalf("expected slot to be 0x00 for root port downstream placement, got %s", dev.Address.Slot)
@@ -1513,11 +1515,12 @@ func TestHostDeviceAddressFormat(t *testing.T) {
 	if dev.Address == nil {
 		t.Fatalf("expected device address to be set")
 	}
-	if dev.Address.Bus != "" {
-		t.Fatalf("expected bus to be empty for PCI placement, got %s", dev.Address.Bus)
+	// After fix to match NVIDIA documentation: devices use Bus attribute (not Controller)
+	if dev.Address.Bus != strconv.Itoa(port.controllerIndex) {
+		t.Fatalf("expected bus to be %d (NVIDIA docs pattern), got %s", port.controllerIndex, dev.Address.Bus)
 	}
-	if dev.Address.Controller != strconv.Itoa(port.controllerIndex) {
-		t.Fatalf("expected controller to be %d, got %s", port.controllerIndex, dev.Address.Controller)
+	if dev.Address.Controller != "" {
+		t.Fatalf("expected controller to be empty (using Bus instead), got %s", dev.Address.Controller)
 	}
 	if dev.Address.Slot != "0x00" {
 		t.Fatalf("expected slot to be 0x00 for root port downstream placement, got %s", dev.Address.Slot)
@@ -1817,11 +1820,12 @@ func TestApplyNUMAHostDeviceTopologyRealWorldScenario(t *testing.T) {
 		if dev.Address == nil {
 			t.Fatalf("expected host device %d to have an address assigned", i)
 		}
-		if dev.Address.Controller == "" {
-			t.Fatalf("expected host device %d to reference a root port controller", i)
+		// After fix to match NVIDIA documentation: devices use Bus attribute (not Controller)
+		if dev.Address.Bus == "" {
+			t.Fatalf("expected host device %d to have bus assigned (NVIDIA docs pattern)", i)
 		}
-		if dev.Address.Bus != "" {
-			t.Fatalf("expected host device %d to leave bus assignment to libvirt, got %s", i, dev.Address.Bus)
+		if dev.Address.Controller != "" {
+			t.Fatalf("expected host device %d to leave controller empty (using Bus instead), got %s", i, dev.Address.Controller)
 		}
 	}
 }
@@ -2034,4 +2038,527 @@ func TestNUMAPCIPlannerBusNumberAllocation(t *testing.T) {
 	t.Logf("  PXB NUMA 0: 0x%02x (%d)", pxbNuma0Bus, pxbNuma0Bus)
 	t.Logf("  PXB NUMA 1: 0x%02x (%d)", pxbNuma1Bus, pxbNuma1Bus)
 	t.Logf("  Total controllers: %d", len(domain.Spec.Devices.Controllers))
+}
+
+// TestHGXH200TopologyWithPCIeSwitches tests the HGX H200 topology pattern:
+// - 8 GPUs (4 per NUMA node) behind PCIe switches
+// - 4 IB NICs (2 per NUMA node) behind PCIe switches
+// - Devices sharing same physical switch get virtual switch in guest
+func TestHGXH200TopologyWithPCIeSwitches(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	// Mock HGX H200 physical topology:
+	// NUMA 0: 4 GPUs sharing switch at 0000:17:00.0, 2 IB NICs sharing switch at 0000:18:00.0
+	// NUMA 1: 4 GPUs sharing switch at 0000:85:00.0, 2 IB NICs sharing switch at 0000:86:00.0
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		domain := strings.TrimPrefix(addr.Domain, "0x")
+		bus := strings.TrimPrefix(addr.Bus, "0x")
+		slot := strings.TrimPrefix(addr.Slot, "0x")
+		function := strings.TrimPrefix(addr.Function, "0x")
+		return fmt.Sprintf("%s:%s:%s.%s", domain, bus, slot, function), nil
+	}
+
+	getDeviceNumaNodeIntFunc = func(bdf string) (int, error) {
+		// GPUs and NICs on NUMA 0
+		if strings.HasPrefix(bdf, "0000:06:") || strings.HasPrefix(bdf, "0000:07:") ||
+			strings.HasPrefix(bdf, "0000:08:") || strings.HasPrefix(bdf, "0000:09:") {
+			return 0, nil // 4 GPUs on NUMA 0
+		}
+		if strings.HasPrefix(bdf, "0000:0a:") || strings.HasPrefix(bdf, "0000:0b:") {
+			return 0, nil // 2 IB NICs on NUMA 0
+		}
+		// GPUs and NICs on NUMA 1
+		if strings.HasPrefix(bdf, "0000:83:") || strings.HasPrefix(bdf, "0000:84:") ||
+			strings.HasPrefix(bdf, "0000:85:") || strings.HasPrefix(bdf, "0000:86:") {
+			return 1, nil // 4 GPUs on NUMA 1
+		}
+		if strings.HasPrefix(bdf, "0000:87:") || strings.HasPrefix(bdf, "0000:88:") {
+			return 1, nil // 2 IB NICs on NUMA 1
+		}
+		return -1, fmt.Errorf("unknown device")
+	}
+
+	getDevicePCIProximityGroupFunc = func(bdf string) (string, error) {
+		// Group devices by their physical switch
+		numaNode, _ := getDeviceNumaNodeIntFunc(bdf)
+		if strings.HasPrefix(bdf, "0000:06:") || strings.HasPrefix(bdf, "0000:07:") ||
+			strings.HasPrefix(bdf, "0000:08:") || strings.HasPrefix(bdf, "0000:09:") {
+			return fmt.Sprintf("numa-%d-gpu-switch", numaNode), nil
+		}
+		if strings.HasPrefix(bdf, "0000:83:") || strings.HasPrefix(bdf, "0000:84:") ||
+			strings.HasPrefix(bdf, "0000:85:") || strings.HasPrefix(bdf, "0000:86:") {
+			return fmt.Sprintf("numa-%d-gpu-switch", numaNode), nil
+		}
+		if strings.HasPrefix(bdf, "0000:0a:") || strings.HasPrefix(bdf, "0000:0b:") {
+			return fmt.Sprintf("numa-%d-ib-switch", numaNode), nil
+		}
+		if strings.HasPrefix(bdf, "0000:87:") || strings.HasPrefix(bdf, "0000:88:") {
+			return fmt.Sprintf("numa-%d-ib-switch", numaNode), nil
+		}
+		return "", fmt.Errorf("unknown device")
+	}
+
+	getDevicePCIPathHierarchyFunc = func(bdf string) ([]string, error) {
+		// Simulate devices behind physical PCIe switches
+		// Key insight: Devices sharing a physical switch share the same parent path
+		// The switch upstream port is the common parent
+
+		// GPUs on NUMA 0 all share switch at 0000:17:00.0
+		if strings.HasPrefix(bdf, "0000:06:") || strings.HasPrefix(bdf, "0000:07:") ||
+			strings.HasPrefix(bdf, "0000:08:") || strings.HasPrefix(bdf, "0000:09:") {
+			return []string{"0000:00:00.0", "0000:17:00.0", bdf}, nil
+		}
+		// IB NICs on NUMA 0 all share switch at 0000:20:00.0
+		if strings.HasPrefix(bdf, "0000:0a:") || strings.HasPrefix(bdf, "0000:0b:") {
+			return []string{"0000:00:00.0", "0000:20:00.0", bdf}, nil
+		}
+		// GPUs on NUMA 1 all share switch at 0000:85:00.0
+		if strings.HasPrefix(bdf, "0000:83:") || strings.HasPrefix(bdf, "0000:84:") ||
+			strings.HasPrefix(bdf, "0000:85:") || strings.HasPrefix(bdf, "0000:86:") {
+			return []string{"0000:00:00.0", "0000:85:00.0", bdf}, nil
+		}
+		// IB NICs on NUMA 1 all share switch at 0000:90:00.0
+		if strings.HasPrefix(bdf, "0000:87:") || strings.HasPrefix(bdf, "0000:88:") {
+			return []string{"0000:00:00.0", "0000:90:00.0", bdf}, nil
+		}
+		return nil, fmt.Errorf("unknown device")
+	}
+
+	getDeviceIOMMUGroupInfoFunc = func(bdf string) (int, []string, error) {
+		// Each device in its own IOMMU group for simplicity
+		return 0, []string{bdf}, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			CPU: api.CPU{
+				NUMA: &api.NUMA{
+					Cells: []api.NUMACell{
+						{ID: "0"},
+						{ID: "1"},
+					},
+				},
+			},
+			Devices: api.Devices{
+				HostDevices: []api.HostDevice{
+					// NUMA 0 GPUs (4 devices sharing switch path)
+					newTestPCIHostDevice("gpu0", "0000", "06"),
+					newTestPCIHostDevice("gpu1", "0000", "07"),
+					newTestPCIHostDevice("gpu2", "0000", "08"),
+					newTestPCIHostDevice("gpu3", "0000", "09"),
+					// NUMA 0 IB NICs (2 devices sharing switch path)
+					newTestPCIHostDevice("ib0", "0000", "0a"),
+					newTestPCIHostDevice("ib1", "0000", "0b"),
+					// NUMA 1 GPUs (4 devices sharing switch path)
+					newTestPCIHostDevice("gpu4", "0000", "83"),
+					newTestPCIHostDevice("gpu5", "0000", "84"),
+					newTestPCIHostDevice("gpu6", "0000", "85"),
+					newTestPCIHostDevice("gpu7", "0000", "86"),
+					// NUMA 1 IB NICs (2 devices sharing switch path)
+					newTestPCIHostDevice("ib2", "0000", "87"),
+					newTestPCIHostDevice("ib3", "0000", "88"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	// Verify PXB controllers for both NUMA nodes
+	pxbCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-expander-bus" {
+			pxbCount++
+		}
+	}
+	if pxbCount != 2 {
+		t.Fatalf("expected 2 PXB controllers (one per NUMA node), got %d", pxbCount)
+	}
+
+	// Verify PCIe switches were created
+	// Should have 4 switches total: 2 for GPU groups (NUMA 0 & 1), 2 for IB groups (NUMA 0 & 1)
+	upstreamCount := 0
+	downstreamCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-switch-upstream-port" {
+			upstreamCount++
+		}
+		if ctrl.Model == "pcie-switch-downstream-port" {
+			downstreamCount++
+		}
+	}
+
+	expectedSwitches := 4 // 2 GPU switches + 2 IB switches
+	if upstreamCount != expectedSwitches {
+		t.Fatalf("expected %d upstream ports (one per switch), got %d", expectedSwitches, upstreamCount)
+	}
+
+	// Each GPU switch needs 4 downstream ports, each IB switch needs 2
+	// But implementation creates 4 ports minimum (NVIDIA standard)
+	expectedDownstream := 16 // 4 switches × 4 ports each
+	if downstreamCount != expectedDownstream {
+		t.Fatalf("expected %d downstream ports (%d switches × 4 ports), got %d", expectedDownstream, expectedSwitches, downstreamCount)
+	}
+
+	// Verify all devices got Bus attribute assigned (not Controller)
+	for i, dev := range domain.Spec.Devices.HostDevices {
+		if dev.Address == nil {
+			t.Fatalf("device %d missing address", i)
+		}
+		if dev.Address.Bus == "" {
+			t.Fatalf("device %d missing Bus attribute (NVIDIA pattern)", i)
+		}
+		if dev.Address.Controller != "" {
+			t.Fatalf("device %d has Controller attribute (should use Bus), got %s", i, dev.Address.Controller)
+		}
+	}
+
+	t.Logf("✓ HGX H200 topology verified:")
+	t.Logf("  PXB controllers: %d (NUMA 0 + NUMA 1)", pxbCount)
+	t.Logf("  PCIe switches: %d (2 GPU switches + 2 IB switches)", upstreamCount)
+	t.Logf("  Downstream ports: %d (%d per switch)", downstreamCount, downstreamCount/upstreamCount)
+	t.Logf("  Total devices: %d (8 GPUs + 4 IB NICs)", len(domain.Spec.Devices.HostDevices))
+}
+
+// TestSimpleServerDirectTopology tests simple server topology:
+// - 4 GPUs (2 per NUMA node) directly on root ports
+// - No physical PCIe switches - each device has unique path
+// - Should NOT create virtual switches
+func TestSimpleServerDirectTopology(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		domain := strings.TrimPrefix(addr.Domain, "0x")
+		bus := strings.TrimPrefix(addr.Bus, "0x")
+		slot := strings.TrimPrefix(addr.Slot, "0x")
+		function := strings.TrimPrefix(addr.Function, "0x")
+		return fmt.Sprintf("%s:%s:%s.%s", domain, bus, slot, function), nil
+	}
+
+	getDeviceNumaNodeIntFunc = func(bdf string) (int, error) {
+		if strings.HasPrefix(bdf, "0000:03:") || strings.HasPrefix(bdf, "0000:04:") {
+			return 0, nil // 2 GPUs on NUMA 0
+		}
+		if strings.HasPrefix(bdf, "0000:83:") || strings.HasPrefix(bdf, "0000:84:") {
+			return 1, nil // 2 GPUs on NUMA 1
+		}
+		return -1, fmt.Errorf("unknown device")
+	}
+
+	getDevicePCIProximityGroupFunc = func(bdf string) (string, error) {
+		numaNode, _ := getDeviceNumaNodeIntFunc(bdf)
+		return fmt.Sprintf("numa-%d", numaNode), nil
+	}
+
+	getDevicePCIPathHierarchyFunc = func(bdf string) ([]string, error) {
+		// Each device directly on root complex - unique paths (no shared switches)
+		if strings.HasPrefix(bdf, "0000:03:") {
+			return []string{"0000:00:00.0", "0000:01:00.0", bdf}, nil
+		}
+		if strings.HasPrefix(bdf, "0000:04:") {
+			return []string{"0000:00:00.0", "0000:02:00.0", bdf}, nil
+		}
+		if strings.HasPrefix(bdf, "0000:83:") {
+			return []string{"0000:00:00.0", "0000:81:00.0", bdf}, nil
+		}
+		if strings.HasPrefix(bdf, "0000:84:") {
+			return []string{"0000:00:00.0", "0000:82:00.0", bdf}, nil
+		}
+		return nil, fmt.Errorf("unknown device")
+	}
+
+	getDeviceIOMMUGroupInfoFunc = func(bdf string) (int, []string, error) {
+		return 0, []string{bdf}, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			CPU: api.CPU{
+				NUMA: &api.NUMA{
+					Cells: []api.NUMACell{
+						{ID: "0"},
+						{ID: "1"},
+					},
+				},
+			},
+			Devices: api.Devices{
+				HostDevices: []api.HostDevice{
+					// NUMA 0 GPUs (each with unique path - direct attachment)
+					newTestPCIHostDevice("gpu0", "0000", "03"),
+					newTestPCIHostDevice("gpu1", "0000", "04"),
+					// NUMA 1 GPUs (each with unique path - direct attachment)
+					newTestPCIHostDevice("gpu2", "0000", "83"),
+					newTestPCIHostDevice("gpu3", "0000", "84"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	// Verify PXB controllers for both NUMA nodes
+	pxbCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-expander-bus" {
+			pxbCount++
+		}
+	}
+	if pxbCount != 2 {
+		t.Fatalf("expected 2 PXB controllers (one per NUMA node), got %d", pxbCount)
+	}
+
+	// Verify NO PCIe switches were created (direct topology)
+	upstreamCount := 0
+	downstreamCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-switch-upstream-port" {
+			upstreamCount++
+		}
+		if ctrl.Model == "pcie-switch-downstream-port" {
+			downstreamCount++
+		}
+	}
+
+	if upstreamCount != 0 {
+		t.Fatalf("expected 0 upstream ports (direct topology, no switches), got %d", upstreamCount)
+	}
+	if downstreamCount != 0 {
+		t.Fatalf("expected 0 downstream ports (direct topology, no switches), got %d", downstreamCount)
+	}
+
+	// Verify root ports were created (one per device)
+	rootPortCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil {
+			aliasName := ctrl.Alias.GetName()
+			if strings.HasPrefix(aliasName, numaRootPortPrefix) {
+				rootPortCount++
+			}
+		}
+	}
+	if rootPortCount != len(domain.Spec.Devices.HostDevices) {
+		t.Fatalf("expected %d root ports (one per device), got %d", len(domain.Spec.Devices.HostDevices), rootPortCount)
+	}
+
+	// Verify all devices got Bus attribute assigned directly to root ports
+	for i, dev := range domain.Spec.Devices.HostDevices {
+		if dev.Address == nil {
+			t.Fatalf("device %d missing address", i)
+		}
+		if dev.Address.Bus == "" {
+			t.Fatalf("device %d missing Bus attribute (NVIDIA pattern)", i)
+		}
+		if dev.Address.Controller != "" {
+			t.Fatalf("device %d has Controller attribute (should use Bus), got %s", i, dev.Address.Controller)
+		}
+	}
+
+	t.Logf("✓ Simple server topology verified:")
+	t.Logf("  PXB controllers: %d (NUMA 0 + NUMA 1)", pxbCount)
+	t.Logf("  PCIe switches: 0 (direct topology, no switches needed)")
+	t.Logf("  Root ports: %d (one per device, direct attachment)", rootPortCount)
+	t.Logf("  Total devices: %d (4 GPUs)", len(domain.Spec.Devices.HostDevices))
+}
+
+// TestMixedTopology tests mixed environment:
+// - Some devices behind physical switches (get virtual switches)
+// - Some devices directly on root ports (no virtual switches)
+// - Tests that planner handles both patterns correctly in same VM
+func TestMixedTopology(t *testing.T) {
+	defer restoreNUMAHelpers()
+
+	formatPCIAddressFunc = func(addr *api.Address) (string, error) {
+		domain := strings.TrimPrefix(addr.Domain, "0x")
+		bus := strings.TrimPrefix(addr.Bus, "0x")
+		slot := strings.TrimPrefix(addr.Slot, "0x")
+		function := strings.TrimPrefix(addr.Function, "0x")
+		return fmt.Sprintf("%s:%s:%s.%s", domain, bus, slot, function), nil
+	}
+
+	getDeviceNumaNodeIntFunc = func(bdf string) (int, error) {
+		// NUMA 0: 4 GPUs behind switch + 1 IB NIC direct
+		if strings.HasPrefix(bdf, "0000:06:") || strings.HasPrefix(bdf, "0000:07:") ||
+			strings.HasPrefix(bdf, "0000:08:") || strings.HasPrefix(bdf, "0000:09:") ||
+			strings.HasPrefix(bdf, "0000:0a:") {
+			return 0, nil
+		}
+		// NUMA 1: 2 GPUs direct + 2 IB NICs behind switch
+		if strings.HasPrefix(bdf, "0000:83:") || strings.HasPrefix(bdf, "0000:84:") ||
+			strings.HasPrefix(bdf, "0000:85:") || strings.HasPrefix(bdf, "0000:86:") {
+			return 1, nil
+		}
+		return -1, fmt.Errorf("unknown device")
+	}
+
+	getDevicePCIProximityGroupFunc = func(bdf string) (string, error) {
+		numaNode, _ := getDeviceNumaNodeIntFunc(bdf)
+		return fmt.Sprintf("numa-%d", numaNode), nil
+	}
+
+	getDevicePCIPathHierarchyFunc = func(bdf string) ([]string, error) {
+		// NUMA 0: 4 GPUs share switch at 0000:17:00.0
+		if strings.HasPrefix(bdf, "0000:06:") || strings.HasPrefix(bdf, "0000:07:") ||
+			strings.HasPrefix(bdf, "0000:08:") || strings.HasPrefix(bdf, "0000:09:") {
+			return []string{"0000:00:00.0", "0000:17:00.0", bdf}, nil
+		}
+		// NUMA 0: 1 IB NIC direct (unique path)
+		if strings.HasPrefix(bdf, "0000:0a:") {
+			return []string{"0000:00:00.0", "0000:20:00.0", bdf}, nil
+		}
+		// NUMA 1: 2 GPUs direct (unique paths)
+		if strings.HasPrefix(bdf, "0000:83:") {
+			return []string{"0000:00:00.0", "0000:81:00.0", bdf}, nil
+		}
+		if strings.HasPrefix(bdf, "0000:84:") {
+			return []string{"0000:00:00.0", "0000:82:00.0", bdf}, nil
+		}
+		// NUMA 1: 2 IB NICs share switch at 0000:90:00.0
+		if strings.HasPrefix(bdf, "0000:85:") || strings.HasPrefix(bdf, "0000:86:") {
+			return []string{"0000:00:00.0", "0000:90:00.0", bdf}, nil
+		}
+		return nil, fmt.Errorf("unknown device")
+	}
+
+	getDeviceIOMMUGroupInfoFunc = func(bdf string) (int, []string, error) {
+		return 0, []string{bdf}, nil
+	}
+
+	vmi := &v1.VirtualMachineInstance{
+		Spec: v1.VirtualMachineInstanceSpec{
+			Domain: v1.DomainSpec{
+				CPU: &v1.CPU{
+					NUMA: &v1.NUMA{
+						GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+					},
+				},
+			},
+		},
+	}
+
+	domain := &api.Domain{
+		Spec: api.DomainSpec{
+			CPU: api.CPU{
+				NUMA: &api.NUMA{
+					Cells: []api.NUMACell{
+						{ID: "0"},
+						{ID: "1"},
+					},
+				},
+			},
+			Devices: api.Devices{
+				HostDevices: []api.HostDevice{
+					// NUMA 0: 4 GPUs behind switch
+					newTestPCIHostDevice("gpu0", "0000", "06"),
+					newTestPCIHostDevice("gpu1", "0000", "07"),
+					newTestPCIHostDevice("gpu2", "0000", "08"),
+					newTestPCIHostDevice("gpu3", "0000", "09"),
+					// NUMA 0: 1 IB NIC direct
+					newTestPCIHostDevice("ib0", "0000", "0a"),
+					// NUMA 1: 2 GPUs direct
+					newTestPCIHostDevice("gpu4", "0000", "83"),
+					newTestPCIHostDevice("gpu5", "0000", "84"),
+					// NUMA 1: 2 IB NICs behind switch
+					newTestPCIHostDevice("ib1", "0000", "85"),
+					newTestPCIHostDevice("ib2", "0000", "86"),
+				},
+			},
+		},
+	}
+
+	ApplyNUMAHostDeviceTopology(vmi, domain)
+
+	// Verify PXB controllers for both NUMA nodes
+	pxbCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-expander-bus" {
+			pxbCount++
+		}
+	}
+	if pxbCount != 2 {
+		t.Fatalf("expected 2 PXB controllers (one per NUMA node), got %d", pxbCount)
+	}
+
+	// Verify PCIe switches: Should have 2 switches (NUMA 0 GPU switch + NUMA 1 IB switch)
+	upstreamCount := 0
+	downstreamCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-switch-upstream-port" {
+			upstreamCount++
+		}
+		if ctrl.Model == "pcie-switch-downstream-port" {
+			downstreamCount++
+		}
+	}
+
+	expectedSwitches := 2 // NUMA 0 GPU switch (4 devices) + NUMA 1 IB switch (2 devices)
+	if upstreamCount != expectedSwitches {
+		t.Fatalf("expected %d upstream ports (mixed topology), got %d", expectedSwitches, upstreamCount)
+	}
+
+	// Each switch gets 4 downstream ports (NVIDIA standard)
+	expectedDownstream := 8 // 2 switches × 4 ports
+	if downstreamCount != expectedDownstream {
+		t.Fatalf("expected %d downstream ports (%d switches × 4 ports), got %d", expectedDownstream, expectedSwitches, downstreamCount)
+	}
+
+	// Verify root ports: 2 for switches + 3 for direct devices = 5 total
+	rootPortCount := 0
+	for _, ctrl := range domain.Spec.Devices.Controllers {
+		if ctrl.Model == "pcie-root-port" && ctrl.Alias != nil {
+			aliasName := ctrl.Alias.GetName()
+			if strings.HasPrefix(aliasName, numaRootPortPrefix) {
+				rootPortCount++
+			}
+		}
+	}
+	expectedRootPorts := 5 // 2 for switches + 3 for direct devices
+	if rootPortCount != expectedRootPorts {
+		t.Fatalf("expected %d root ports (2 for switches + 3 direct), got %d", expectedRootPorts, rootPortCount)
+	}
+
+	// Verify all devices got Bus attribute assigned
+	for i, dev := range domain.Spec.Devices.HostDevices {
+		if dev.Address == nil {
+			t.Fatalf("device %d missing address", i)
+		}
+		if dev.Address.Bus == "" {
+			t.Fatalf("device %d missing Bus attribute (NVIDIA pattern)", i)
+		}
+		if dev.Address.Controller != "" {
+			t.Fatalf("device %d has Controller attribute (should use Bus), got %s", i, dev.Address.Controller)
+		}
+	}
+
+	t.Logf("✓ Mixed topology verified:")
+	t.Logf("  PXB controllers: %d (NUMA 0 + NUMA 1)", pxbCount)
+	t.Logf("  PCIe switches: %d (1 GPU switch on NUMA 0 + 1 IB switch on NUMA 1)", upstreamCount)
+	t.Logf("  Downstream ports: %d (%d per switch)", downstreamCount, downstreamCount/upstreamCount)
+	t.Logf("  Root ports: %d (2 for switches + 3 for direct devices)", rootPortCount)
+	t.Logf("  Total devices: %d (6 GPUs + 3 NICs)", len(domain.Spec.Devices.HostDevices))
+	t.Logf("  Distribution: NUMA 0 has 4 GPUs (switch) + 1 NIC (direct), NUMA 1 has 2 GPUs (direct) + 2 NICs (switch)")
 }
