@@ -159,6 +159,59 @@ func rootPortAlias(key deviceGroupKey) string {
 	return fmt.Sprintf("%s-%x", numaRootPortPrefix, sum[:rootPortAliasLength/2])
 }
 
+// ComputePCISwitchGroupKey generates a grouping key for devices based on their shared PCIe switch topology.
+// Devices behind the same PCIe switch (sharing the same upstream bridge) will get the same key,
+// allowing them to be grouped together and attached to a virtual PCIe switch that mirrors the physical topology.
+//
+// Physical PCIe Switch Topology:
+//
+//	Root Port (0000:00:01.1)
+//	  └─ PCIe Switch Upstream Port (0000:01:00.0) ← THE SWITCH
+//	       ├─ Downstream Port 0 (0000:02:00.0) → Device (0000:03:00.0) GPU0
+//	       ├─ Downstream Port 1 (0000:02:01.0) → Device (0000:04:00.0) GPU1
+//	       ├─ Downstream Port 2 (0000:02:02.0) → Device (0000:05:00.0) GPU2
+//	       └─ Downstream Port 3 (0000:02:03.0) → Device (0000:06:00.0) GPU3
+//
+// In the PCI path hierarchy:
+//   - path[0]: Root complex port (e.g., "0000:00:01.1")
+//   - path[1]: PCIe Switch Upstream Port (e.g., "0000:01:00.0") ← Group by this!
+//   - path[2]: PCIe Switch Downstream Port (e.g., "0000:02:00.0", "0000:02:01.0", etc.)
+//   - path[3]: Endpoint Device (e.g., "0000:03:00.0")
+//
+// All devices with the same path[0..1] share the same physical PCIe switch.
+func ComputePCISwitchGroupKey(path []string, bdf string) string {
+	if len(path) == 0 {
+		return bdf
+	}
+
+	// Single element path: device directly on root bus
+	if len(path) == 1 {
+		return bdf
+	}
+
+	// Two element path: device directly behind root port (no switch)
+	// e.g., ["0000:00:01.1", "0000:41:00.0"] for direct-attached NIC
+	if len(path) == 2 {
+		return strings.Join(path[:1], "/")
+	}
+
+	// For 3+ element paths, we have a switch topology:
+	// path = ["root_port", "switch_upstream", "switch_downstream", "device"]
+	//
+	// Group by path[1] (the switch upstream port) to identify devices behind same switch
+	// This correctly groups:
+	//   - GPU0: ["0000:00:01.1", "0000:01:00.0", "0000:02:00.0", "0000:03:00.0"]
+	//   - GPU1: ["0000:00:01.1", "0000:01:00.0", "0000:02:01.0", "0000:04:00.0"]
+	// Both group to: "0000:00:01.1/0000:01:00.0"
+	if len(path) >= 3 {
+		// Return path up to and including the switch upstream port
+		return strings.Join(path[:2], "/")
+	}
+
+	// Fallback: use full path excluding device
+	return strings.Join(path[:len(path)-1], "/")
+}
+
 func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Domain) {
 	if vmi == nil || domain == nil {
 		return
@@ -221,10 +274,7 @@ func ApplyNUMAHostDeviceTopology(vmi *v1.VirtualMachineInstance, domain *api.Dom
 			log.Log.V(1).Reason(err).Infof("skipping host device %s - unable to derive PCI hierarchy", bdf)
 			continue
 		}
-		pathKey := bdf
-		if len(path) > 1 {
-			pathKey = strings.Join(path[:len(path)-1], "/")
-		}
+		pathKey := ComputePCISwitchGroupKey(path, bdf)
 
 		iommuGroup, iommuPeers, err := getDeviceIOMMUGroupInfoFunc(bdf)
 		if err != nil {
@@ -829,17 +879,16 @@ func (p *numaPCIPlanner) addPCIeSwitch(rootPort *rootPortInfo, numDownstreamPort
 	}
 
 	// PCIe switch upstream port - connects to root port
+	// Use x3130-upstream which is the QEMU device model for PCIe switch upstream port
+	// Note: upstream ports don't use chassis/port in target (only downstream ports do)
 	upstreamController := api.Controller{
 		Type:  "pci",
 		Index: strconv.Itoa(upstreamIndex),
 		Model: "pcie-switch-upstream-port",
 		ModelInfo: &api.ControllerModel{
-			Name: "pcie-switch-upstream-port",
+			Name: "x3130-upstream",
 		},
-		Target: &api.ControllerTarget{
-			Chassis: strconv.Itoa(upstreamChassis),
-			Port:    "0x0",
-		},
+		// No Target for upstream port - it doesn't support chassis/port attributes
 		Alias: api.NewUserDefinedAlias(fmt.Sprintf("numa-switch-up-%d", upstreamIndex)),
 		Address: &api.Address{
 			Type:     api.AddressPCI,
@@ -852,8 +901,8 @@ func (p *numaPCIPlanner) addPCIeSwitch(rootPort *rootPortInfo, numDownstreamPort
 
 	p.domain.Spec.Devices.Controllers = append(p.domain.Spec.Devices.Controllers, upstreamController)
 
-	log.Log.V(1).Infof("NUMA PCI Planner: Created PCIe switch upstream port index=%d, chassis=%d, attached to root port controller=%d",
-		upstreamIndex, upstreamChassis, rootPort.controllerIndex)
+	log.Log.V(1).Infof("NUMA PCI Planner: Created PCIe switch upstream port index=%d, attached to root port controller=%d",
+		upstreamIndex, rootPort.controllerIndex)
 
 	// Create downstream ports
 	switchInfo := &pcieSwitchInfo{
@@ -894,12 +943,13 @@ func (p *numaPCIPlanner) addPCIeDownstreamPort(switchInfo *pcieSwitchInfo, portN
 	}
 
 	// PCIe switch downstream port - connects to upstream port
+	// Use xio3130-downstream which is the QEMU device model for PCIe switch downstream port
 	downstreamController := api.Controller{
 		Type:  "pci",
 		Index: strconv.Itoa(downstreamIndex),
 		Model: "pcie-switch-downstream-port",
 		ModelInfo: &api.ControllerModel{
-			Name: "pcie-switch-downstream-port",
+			Name: "xio3130-downstream",
 		},
 		Target: &api.ControllerTarget{
 			Chassis: strconv.Itoa(downstreamChassis),

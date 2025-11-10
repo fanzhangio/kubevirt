@@ -2562,3 +2562,102 @@ func TestMixedTopology(t *testing.T) {
 	t.Logf("  Total devices: %d (6 GPUs + 3 NICs)", len(domain.Spec.Devices.HostDevices))
 	t.Logf("  Distribution: NUMA 0 has 4 GPUs (switch) + 1 NIC (direct), NUMA 1 has 2 GPUs (direct) + 2 NICs (switch)")
 }
+
+func TestComputePCISwitchGroupKey(t *testing.T) {
+	testCases := []struct {
+		name     string
+		path     []string
+		bdf      string
+		expected string
+	}{
+		{
+			name:     "GPU0 behind switch on NUMA 0",
+			path:     []string{"0000:00:01.1", "0000:01:00.0", "0000:02:00.0", "0000:03:00.0"},
+			bdf:      "0000:03:00.0",
+			expected: "0000:00:01.1/0000:01:00.0",
+		},
+		{
+			name:     "GPU1 behind same switch on NUMA 0",
+			path:     []string{"0000:00:01.1", "0000:01:00.0", "0000:02:01.0", "0000:04:00.0"},
+			bdf:      "0000:04:00.0",
+			expected: "0000:00:01.1/0000:01:00.0",
+		},
+		{
+			name:     "GPU2 behind same switch on NUMA 0",
+			path:     []string{"0000:00:01.1", "0000:01:00.0", "0000:02:02.0", "0000:05:00.0"},
+			bdf:      "0000:05:00.0",
+			expected: "0000:00:01.1/0000:01:00.0",
+		},
+		{
+			name:     "NIC0 behind same switch on NUMA 0",
+			path:     []string{"0000:00:01.1", "0000:01:00.0", "0000:02:04.0", "0000:07:00.0"},
+			bdf:      "0000:07:00.0",
+			expected: "0000:00:01.1/0000:01:00.0",
+		},
+		{
+			name:     "GPU on NUMA 1 behind different switch",
+			path:     []string{"0000:80:01.1", "0000:81:00.0", "0000:82:00.0", "0000:83:00.0"},
+			bdf:      "0000:83:00.0",
+			expected: "0000:80:01.1/0000:81:00.0",
+		},
+		{
+			name:     "Direct-attached NIC (no switch)",
+			path:     []string{"0000:40:01.1", "0000:41:00.0"},
+			bdf:      "0000:41:00.0",
+			expected: "0000:40:01.1",
+		},
+		{
+			name:     "Single element path",
+			path:     []string{"0000:00:00.0"},
+			bdf:      "0000:00:00.0",
+			expected: "0000:00:00.0",
+		},
+		{
+			name:     "Empty path",
+			path:     []string{},
+			bdf:      "0000:00:00.0",
+			expected: "0000:00:00.0",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ComputePCISwitchGroupKey(tc.path, tc.bdf)
+			if result != tc.expected {
+				t.Errorf("ComputePCISwitchGroupKey(%v, %s) = %s, expected %s",
+					tc.path, tc.bdf, result, tc.expected)
+			}
+		})
+	}
+
+	// Test that devices behind the same switch get the same key
+	t.Run("devices behind same switch have same key", func(t *testing.T) {
+		gpu0Path := []string{"0000:00:01.1", "0000:01:00.0", "0000:02:00.0", "0000:03:00.0"}
+		gpu1Path := []string{"0000:00:01.1", "0000:01:00.0", "0000:02:01.0", "0000:04:00.0"}
+		nic0Path := []string{"0000:00:01.1", "0000:01:00.0", "0000:02:04.0", "0000:07:00.0"}
+
+		key0 := ComputePCISwitchGroupKey(gpu0Path, "0000:03:00.0")
+		key1 := ComputePCISwitchGroupKey(gpu1Path, "0000:04:00.0")
+		keyNIC := ComputePCISwitchGroupKey(nic0Path, "0000:07:00.0")
+
+		if key0 != key1 {
+			t.Errorf("GPU0 and GPU1 should have same key, got %s and %s", key0, key1)
+		}
+		if key0 != keyNIC {
+			t.Errorf("GPU0 and NIC0 should have same key, got %s and %s", key0, keyNIC)
+		}
+	})
+
+	// Test that devices behind different switches get different keys
+	t.Run("devices behind different switches have different keys", func(t *testing.T) {
+		numa0Path := []string{"0000:00:01.1", "0000:01:00.0", "0000:02:00.0", "0000:03:00.0"}
+		numa1Path := []string{"0000:80:01.1", "0000:81:00.0", "0000:82:00.0", "0000:83:00.0"}
+
+		key0 := ComputePCISwitchGroupKey(numa0Path, "0000:03:00.0")
+		key1 := ComputePCISwitchGroupKey(numa1Path, "0000:83:00.0")
+
+		if key0 == key1 {
+			t.Errorf("Devices on different NUMA nodes should have different keys, both got %s", key0)
+		}
+	})
+}
