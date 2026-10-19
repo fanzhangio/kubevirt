@@ -182,4 +182,3 @@ func ValidateLaunchSecurityArm64(field *k8sfield.Path, spec *v1.VirtualMachineIn
 
 	return causes
 }
-

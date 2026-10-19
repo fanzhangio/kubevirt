@@ -4645,4 +4645,3 @@ func newValidateStub(statusCauses ...metav1.StatusCause) SpecValidator {
 		return statusCauses
 	}
 }
-
