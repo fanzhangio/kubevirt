@@ -596,6 +596,13 @@ func validateLaunchSecurity(field *k8sfield.Path, spec *v1.VirtualMachineInstanc
 	if launchSecurity == nil {
 		return causes
 	}
+	if launchSecurity.CCA != nil && spec.Architecture != "arm64" {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: "CCA is only supported on arm64",
+			Field:   field.Child("launchSecurity", "cca").String(),
+		}}
+	}
 
 	arch := spec.Architecture
 	switch arch {
@@ -2184,3 +2191,4 @@ func validateServiceAccountName(field *k8sfield.Path, spec *v1.VirtualMachineIns
 
 	return causes
 }
+
