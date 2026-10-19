@@ -146,6 +146,16 @@ func validateSoundDevice(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSp
 func ValidateLaunchSecurityArm64(field *k8sfield.Path, spec *v1.VirtualMachineInstanceSpec, config *virtconfig.ClusterConfig) []metav1.StatusCause {
 	var causes []metav1.StatusCause
 	launchSecurity := spec.Domain.LaunchSecurity
+	if launchSecurity == nil {
+		return causes
+	}
+	if launchSecurity.SEV != nil || launchSecurity.SNP != nil || launchSecurity.TDX != nil {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeForbidden,
+			Message: "Arm64 launchSecurity supports only CCA",
+			Field:   field.Child("launchSecurity").String(),
+		}}
+	}
 
 	if !config.WorkloadEncryptionCCAEnabled() && launchSecurity.CCA != nil {
 		causes = append(causes, metav1.StatusCause{
@@ -161,8 +171,15 @@ func ValidateLaunchSecurityArm64(field *k8sfield.Path, spec *v1.VirtualMachineIn
 				Message: "CCA requires AAVMF (UEFI)",
 				Field:   field.Child("launchSecurity").String(),
 			})
+		} else if firmware.Bootloader.EFI.Persistent != nil && *firmware.Bootloader.EFI.Persistent {
+			causes = append(causes, metav1.StatusCause{
+				Type:    metav1.CauseTypeFieldValueInvalid,
+				Message: "CCA does not work along with Persistent EFI variables",
+				Field:   field.Child("firmware", "bootloader", "efi", "persistent").String(),
+			})
 		}
 	}
 
 	return causes
 }
+
