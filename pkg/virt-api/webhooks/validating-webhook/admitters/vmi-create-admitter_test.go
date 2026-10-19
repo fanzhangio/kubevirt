@@ -2934,6 +2934,92 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 			Expect(causes).To(BeEmpty())
 		})
 
+		DescribeTable("should accept absent LaunchSecurity in the Arm64 helper and dispatcher", func(gateEnabled bool) {
+			if !gateEnabled {
+				disableFeatureGates()
+			}
+			vmi.Spec.Domain.LaunchSecurity = nil
+			Expect(webhooks.ValidateLaunchSecurityArm64(k8sfield.NewPath("fake"), &vmi.Spec, config)).To(BeEmpty())
+			Expect(validateLaunchSecurity(k8sfield.NewPath("fake"), &vmi.Spec, config)).To(BeEmpty())
+			Expect(ValidateVirtualMachineInstanceSpec(k8sfield.NewPath("fake"), &vmi.Spec, config)).To(BeEmpty())
+		},
+			Entry("with CCA enabled", true),
+			Entry("with CCA disabled", false),
+		)
+
+		DescribeTable("should reject CCA on a non-Arm64 architecture", func(architecture string) {
+			vmi.Spec.Architecture = architecture
+			causes := validateLaunchSecurity(k8sfield.NewPath("fake"), &vmi.Spec, config)
+			Expect(causes).To(HaveLen(1))
+			Expect(causes[0].Type).To(Equal(metav1.CauseTypeFieldValueInvalid))
+			Expect(causes[0].Field).To(Equal("fake.launchSecurity.cca"))
+			Expect(causes[0].Message).To(Equal("CCA is only supported on arm64"))
+		},
+			Entry("on amd64", "amd64"),
+			Entry("on s390x", "s390x"),
+		)
+
+		DescribeTable("should reject mixed CCA on amd64 even when an x86 gate is enabled", func(other string) {
+			vmi.Spec.Architecture = "amd64"
+			if other == "sev" {
+				vmi.Spec.Domain.LaunchSecurity.SEV = &v1.SEV{}
+				enableFeatureGates(featuregate.WorkloadEncryptionSEV)
+			} else {
+				vmi.Spec.Domain.LaunchSecurity.TDX = &v1.TDX{}
+				enableFeatureGates(featuregate.WorkloadEncryptionTDX)
+			}
+			causes := validateLaunchSecurity(k8sfield.NewPath("fake"), &vmi.Spec, config)
+			Expect(causes).To(HaveLen(1))
+			Expect(causes[0].Message).To(Equal("CCA is only supported on arm64"))
+			Expect(causes[0].Field).To(Equal("fake.launchSecurity.cca"))
+		},
+			Entry("SEV gate enabled", "sev"),
+			Entry("TDX gate enabled", "tdx"),
+		)
+
+		DescribeTable("should reject other launch-security types on Arm64", func(other string, includeCCA bool) {
+			if !includeCCA {
+				vmi.Spec.Domain.LaunchSecurity.CCA = nil
+			}
+			switch other {
+			case "sev":
+				vmi.Spec.Domain.LaunchSecurity.SEV = &v1.SEV{}
+			case "snp":
+				vmi.Spec.Domain.LaunchSecurity.SNP = &v1.SEVSNP{}
+			case "tdx":
+				vmi.Spec.Domain.LaunchSecurity.TDX = &v1.TDX{}
+			}
+			causes := validateLaunchSecurity(k8sfield.NewPath("fake"), &vmi.Spec, config)
+			Expect(causes).To(HaveLen(1))
+			Expect(causes[0].Type).To(Equal(metav1.CauseTypeForbidden))
+			Expect(causes[0].Field).To(Equal("fake.launchSecurity"))
+			Expect(causes[0].Message).To(Equal("Arm64 launchSecurity supports only CCA"))
+		},
+			Entry("SEV with CCA", "sev", true),
+			Entry("SNP with CCA", "snp", true),
+			Entry("TDX with CCA", "tdx", true),
+			Entry("SEV without CCA", "sev", false),
+			Entry("SNP without CCA", "snp", false),
+			Entry("TDX without CCA", "tdx", false),
+		)
+
+		DescribeTable("should enforce stateless CCA firmware", func(persistent *bool, rejected bool) {
+			vmi.Spec.Domain.Firmware.Bootloader.EFI.Persistent = persistent
+			causes := validateLaunchSecurity(k8sfield.NewPath("fake"), &vmi.Spec, config)
+			if rejected {
+				Expect(causes).To(HaveLen(1))
+				Expect(causes[0].Type).To(Equal(metav1.CauseTypeFieldValueInvalid))
+				Expect(causes[0].Field).To(Equal("fake.firmware.bootloader.efi.persistent"))
+				Expect(causes[0].Message).To(Equal("CCA does not work along with Persistent EFI variables"))
+			} else {
+				Expect(causes).To(BeEmpty())
+			}
+		},
+			Entry("reject persistent variables", pointer.P(true), true),
+			Entry("accept disabled persistence", pointer.P(false), false),
+			Entry("accept omitted persistence", (*bool)(nil), false),
+		)
+
 		It("should reject when the feature gate is disabled", func() {
 			disableFeatureGates()
 			causes := ValidateVirtualMachineInstanceSpec(k8sfield.NewPath("fake"), &vmi.Spec, config)
@@ -4559,3 +4645,4 @@ func newValidateStub(statusCauses ...metav1.StatusCause) SpecValidator {
 		return statusCauses
 	}
 }
+
